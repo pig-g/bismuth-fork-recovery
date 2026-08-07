@@ -1,0 +1,14 @@
+[project]
+name = "bismuth-fork-recovery"
+version = "0.1.0"
+description = "Offline common-ancestor recovery for Bismuth node databases"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-only" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
