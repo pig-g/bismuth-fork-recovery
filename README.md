@@ -46,7 +46,7 @@ cd /path/to/Bismuth
 curl -fLO https://raw.githubusercontent.com/pig-g/bismuth-fork-recovery/main/fork_recovery.py
 
 # Safe discovery only; no DB mutation.
-python3 fork_recovery.py --config-custom config_custom.txt
+python3 fork_recovery.py
 ```
 
 You can instead keep this repository separate:
@@ -55,11 +55,19 @@ You can instead keep this repository separate:
 git clone https://github.com/pig-g/bismuth-fork-recovery.git
 cd /path/to/Bismuth
 python3 /path/to/bismuth-fork-recovery/fork_recovery.py \
-  --bismuth-dir . \
-  --config-custom config_custom.txt
+  --bismuth-dir .
 ```
 
-The base directory is validated using upstream sentinel files. Config-relative database paths are resolved against that base directory.
+The default invocation mirrors Foundation upstream: it loads the Bismuth base directory's `config.txt`. If the conventional `config_custom.txt` exists in that directory, it is applied automatically as an override, just as upstream does.
+
+Only specify `--config-custom` when the node itself uses an explicitly selected custom file, especially one with a different name or path. Use the same file for both commands so the recovery tool selects the same database paths and node port:
+
+```bash
+python3 node.py --config-custom my_node_config.txt
+python3 fork_recovery.py --config-custom my_node_config.txt
+```
+
+The base directory is validated using upstream sentinel files. Config-relative database paths and relative custom-config paths are resolved against that base directory.
 
 ## Peer policy
 
@@ -79,9 +87,7 @@ Explicit `--peer` values replace the peer file. A bounded per-peer timeout defau
 First inspect the dry-run plan. Then rerun with `--apply`:
 
 ```bash
-python3 fork_recovery.py \
-  --config-custom config_custom.txt \
-  --apply
+python3 fork_recovery.py --apply
 ```
 
 The tool prints an exact confirmation phrase such as:
@@ -107,7 +113,6 @@ If a process interruption leaves an active manifest in `journal_guard`, `journal
 
 ```bash
 python3 fork_recovery.py \
-  --config-custom config_custom.txt \
   --apply \
   --resume recovery_bundles/fork_recovery_<UTC timestamp>
 ```
@@ -117,8 +122,10 @@ Resume requires the root `.fork_recovery_active.json` marker, an exact match bet
 After success, restart the unchanged node yourself:
 
 ```bash
-python3 node.py --config-custom config_custom.txt
+python3 node.py
 ```
+
+If the stopped node used an explicit custom config, include the same `--config-custom <file>` when planning, applying, resuming, and restarting it.
 
 ## What is modified
 
