@@ -38,11 +38,14 @@ Deliver a standalone `fork_recovery.py` that can be downloaded into, or pointed 
 
 - Minimum two agreeing hashes; default strict majority of selected peers.
 - A tie, timeout-driven quorum failure, malformed response, or no retained ancestor aborts.
-- No operator-supplied raw rollback height mode.
+- Operator-selected rollback modes resolve to a validated retained target; they never accept a raw SQL deletion boundary.
 - Common ancestor `A` is preserved; deletion starts at `A + 1`.
+- Explicit `--rollback-to H` preserves `H`; `--rollback-blocks N` snapshots local tip `T`, preserves `T-N`, and deletes the exact suffix. The options are mutually exclusive and the retained target must match peer-quorum canonical evidence in both ledger and hyper. From the retained target through the tip, both databases must have one contiguous, integer-height, duplicate-free reward-block row per height with identical hashes, checked during planning and again under apply exclusion.
+- Automatic mode requires `local_hash(A+1) != canonical_hash(A+1)`. Explicit mode intentionally permits deletion of a canonical suffix, but revalidates the retained target and unchanged local tip under exclusion before mutation.
 - Default is dry-run.
 - Apply never starts/stops/restarts the node.
 - Full operations use `journal_guard` → `prepared` → `committing` → `restoring` → `complete`; a guard-only interruption ends in idempotently resumable `journal_restored` after mode verification and before active-marker cleanup. Completion is recorded only after DB commit, original journal-mode restoration, reacquired exclusion, and final revalidation.
+- Explicit bundles persist and bind their peer policy to target evidence. Format-3 bundles canonicalize selection mode, rollback request, and peer policy into a recovery-intent digest that is independently bound in the root active marker before the prepared manifest is installed. Resume rejects either a manifest self-digest mismatch or a root/manifest intent mismatch. It also re-resolves and deduplicates textual and IPv4 endpoints. An all-PRE resume refreshes target quorum under exclusion before its first delete; mixed/POST crash recovery follows the already-confirmed immutable plan without a network dependency.
 - Resume never infers success from the ledger tip alone and never creates a new plan over a pending operation.
 - No private keys, wallet data, tokens, or credentials enter logs or manifests.
 

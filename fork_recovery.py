@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline common-ancestor recovery for Bismuth node databases."""
+"""Offline automatic and explicit rollback for Bismuth node databases."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 ROOT_ACTIVE_MARKER = ".fork_recovery_active.json"
 DATABASE_NAMES = ("ledger", "hyper", "index")
@@ -90,6 +90,12 @@ def load_peers(peer_file: Path, explicit_peers: list[str]) -> list[tuple[str, in
         if not isinstance(data, dict):
             raise TypeError(f"peer file must contain a JSON object: {peer_file}")
         peers = [(str(host), int(port)) for host, port in data.items()]
+
+    return resolve_peer_endpoints(peers)
+
+
+def resolve_peer_endpoints(peers: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Resolve peers to unique IPv4 endpoints, rejecting textual and DNS aliases."""
 
     seen_labels: set[tuple[str, int]] = set()
     seen_endpoints: set[tuple[str, int]] = set()
@@ -369,6 +375,63 @@ def unique_local_reward_hash(conn: sqlite3.Connection, height: int) -> str:
     if len(rows) != 1 or not isinstance(rows[0][0], str):
         raise ValueError(f"ambiguous reward rows at local height {height}")
     return rows[0][0]
+
+
+def assert_contiguous_reward_suffix(
+    connection: sqlite3.Connection,
+    table: str,
+    retained_height: int,
+    tip_height: int,
+) -> tuple[tuple[int, str], ...]:
+    if table not in {"transactions", "main.transactions", "hyperdb.transactions"}:
+        raise ValueError(f"unsupported transaction table: {table}")
+    actual = connection.execute(
+        f"SELECT COUNT(*), COUNT(DISTINCT block_height), "
+        f"MIN(block_height), MAX(block_height) FROM {table} "
+        "WHERE block_height >= ? AND block_height <= ? AND reward != 0",
+        (retained_height, tip_height),
+    ).fetchone()
+    expected_count = tip_height - retained_height + 1
+    expected = (
+        expected_count,
+        expected_count,
+        retained_height,
+        tip_height,
+    )
+    if actual != expected:
+        raise RuntimeError(
+            "explicit rollback requires a contiguous reward-block suffix: "
+            f"{table} shape {actual}, expected {expected}"
+        )
+    rows = connection.execute(
+        f"SELECT block_height, block_hash FROM {table} "
+        "WHERE block_height >= ? AND block_height <= ? AND reward != 0 "
+        "ORDER BY block_height",
+        (retained_height, tip_height),
+    ).fetchall()
+    if any(type(height) is not int for height, _block_hash in rows):
+        raise RuntimeError(
+            "explicit rollback requires a contiguous integer reward-block interval: "
+            f"{table}"
+        )
+    return tuple((height, validate_sha224_hash(block_hash)) for height, block_hash in rows)
+
+
+def assert_explicit_reward_suffix(
+    paths: DbPaths,
+    ledger: sqlite3.Connection,
+    retained_height: int,
+    tip_height: int,
+) -> None:
+    ledger_suffix = assert_contiguous_reward_suffix(
+        ledger, "transactions", retained_height, tip_height
+    )
+    with open_local_ledger_readonly(paths.hyper) as hyper:
+        hyper_suffix = assert_contiguous_reward_suffix(
+            hyper, "transactions", retained_height, tip_height
+        )
+    if ledger_suffix != hyper_suffix:
+        raise RuntimeError("ledger and hyper explicit rollback suffixes disagree")
 
 
 def validate_sha224_hash(value: object) -> str:
@@ -769,6 +832,47 @@ def write_journal_guard(
     write_root_active_marker(root, bundle)
 
 
+def recovery_intent_digest(
+    selection_mode: str,
+    rollback_request: dict[str, int] | None,
+    peer_policy: dict[str, object] | None,
+) -> str:
+    payload = {
+        "selection_mode": selection_mode,
+        "rollback_request": rollback_request,
+        "peer_policy": peer_policy,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_manifest_recovery_intent(manifest: dict[str, object]) -> str | None:
+    manifest_format = manifest.get("format")
+    if manifest_format == 2:
+        if manifest.get("selection_mode") == "explicit":
+            raise RuntimeError(
+                "legacy recovery manifest cannot contain unbound explicit recovery intent"
+            )
+        return None
+    if manifest_format != 3:
+        raise RuntimeError("unsupported recovery manifest format")
+    selection_mode = manifest.get("selection_mode")
+    rollback_request = manifest.get("rollback_request")
+    peer_policy = manifest.get("peer_policy")
+    if not isinstance(selection_mode, str):
+        raise TypeError("recovery manifest selection mode is malformed")
+    expected = recovery_intent_digest(
+        selection_mode,
+        rollback_request if isinstance(rollback_request, dict) else None,
+        peer_policy if isinstance(peer_policy, dict) else None,
+    )
+    if manifest.get("recovery_intent_sha256") != expected:
+        raise RuntimeError("recovery manifest recovery intent digest mismatch")
+    return expected
+
+
 def write_recovery_bundle(
     paths: DbPaths,
     plan: RecoveryPlan,
@@ -777,6 +881,9 @@ def write_recovery_bundle(
     locked_connection: sqlite3.Connection | None = None,
     operation_id: str | None = None,
     original_journal_modes: tuple[str, str, str] | None = None,
+    selection_mode: str = "automatic",
+    rollback_request: dict[str, int] | None = None,
+    peer_policy: dict[str, object] | None = None,
 ) -> Path:
     """Export the exact rows targeted by rollback into a lightweight bundle."""
     bundle = Path(bundle_dir)
@@ -868,10 +975,17 @@ def write_recovery_bundle(
     table_manifest = build_table_manifest(
         paths, boundary, tail, locked_connection
     )
+    intent_digest = recovery_intent_digest(
+        selection_mode, rollback_request, peer_policy
+    )
     manifest = {
-        "format": 2,
+        "format": 3,
         "operation_id": operation_id,
         "status": "prepared",
+        "selection_mode": selection_mode,
+        "rollback_request": rollback_request,
+        "peer_policy": peer_policy,
+        "recovery_intent_sha256": intent_digest,
         **plan._asdict(),
         "databases": database_identities(paths),
         "original_journal_modes": journal_mode_mapping(original_journal_modes),
@@ -930,7 +1044,9 @@ def mark_recovery_restoring(bundle_dir: Path) -> None:
     write_manifest_atomic(manifest_path, manifest)
 
 
-def write_root_active_marker(root: Path, bundle_dir: Path) -> None:
+def write_root_active_marker(
+    root: Path, bundle_dir: Path, recovery_intent_sha256: str | None = None
+) -> None:
     manifest = json.loads(
         (Path(bundle_dir) / "manifest.json").read_text(encoding="utf-8")
     )
@@ -938,6 +1054,11 @@ def write_root_active_marker(root: Path, bundle_dir: Path) -> None:
         "operation_id": manifest.get("operation_id"),
         "bundle": str(Path(bundle_dir).resolve()),
     }
+    intent_digest = recovery_intent_sha256 or manifest.get("recovery_intent_sha256")
+    if intent_digest is not None:
+        if not isinstance(intent_digest, str) or len(intent_digest) != 64:
+            raise RuntimeError("recovery intent digest is malformed")
+        marker["recovery_intent_sha256"] = intent_digest
     write_manifest_atomic(Path(root) / ROOT_ACTIVE_MARKER, marker)
 
 
@@ -1199,13 +1320,14 @@ def load_resume_bundle(
     bundle = Path(bundle_dir).resolve()
     manifest_path = bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != 2 or manifest.get("status") not in {
+    if manifest.get("format") not in {2, 3} or manifest.get("status") not in {
         "prepared",
         "committing",
         "restoring",
         "complete",
     }:
         raise RuntimeError("bundle is not a resumable recovery operation")
+    validate_manifest_recovery_intent(manifest)
     tail_path = bundle / str(manifest.get("tail_file"))
     actual_digest = hashlib.sha256(tail_path.read_bytes()).hexdigest()
     if actual_digest != manifest.get("tail_sha256"):
@@ -1225,12 +1347,118 @@ def load_resume_bundle(
     plan = RecoveryPlan(
         *(manifest[field] for field in RecoveryPlan._fields)  # type: ignore[arg-type]
     )
+    validate_resume_plan_metadata(manifest, plan)
     with gzip.open(tail_path, "rt", encoding="utf-8") as handle:
         tail = json.load(handle)
     if not isinstance(tail, dict):
         raise TypeError("recovery tail archive is malformed")
     parse_original_journal_modes(manifest)
     return manifest, plan, tail
+
+
+def validate_resume_plan_metadata(
+    manifest: dict[str, object], plan: RecoveryPlan
+) -> None:
+    integer_fields = (
+        plan.local_tip_height,
+        plan.ancestor_height,
+        plan.first_delete_height,
+        plan.rollback_blocks,
+    )
+    if any(type(value) is not int for value in integer_fields):
+        raise TypeError("recovery plan heights are malformed")
+    if (
+        plan.ancestor_height < 1
+        or plan.local_tip_height < plan.ancestor_height
+        or plan.first_delete_height != plan.ancestor_height + 1
+        or plan.rollback_blocks != plan.local_tip_height - plan.ancestor_height
+    ):
+        raise RuntimeError("recovery plan boundary arithmetic is inconsistent")
+
+    has_mode = "selection_mode" in manifest
+    has_request = "rollback_request" in manifest
+    if not has_mode and not has_request:
+        return
+    if not has_mode or not has_request:
+        raise RuntimeError("recovery rollback selection metadata is incomplete")
+    mode = manifest["selection_mode"]
+    request = manifest["rollback_request"]
+    if mode == "automatic":
+        if request is not None:
+            raise RuntimeError("automatic recovery has an unexpected rollback request")
+        return
+    if mode != "explicit" or not isinstance(request, dict) or len(request) != 1:
+        raise RuntimeError("recovery rollback selection metadata is malformed")
+    if "blocks" in request:
+        blocks = request["blocks"]
+        matches = type(blocks) is int and blocks > 0 and blocks == plan.rollback_blocks
+    elif "to_height" in request:
+        height = request["to_height"]
+        matches = type(height) is int and height == plan.ancestor_height
+    else:
+        matches = False
+    if not matches:
+        raise RuntimeError("rollback request does not match recovery plan")
+    parse_explicit_peer_policy(manifest, plan)
+
+
+def parse_explicit_peer_policy(
+    manifest: dict[str, object], plan: RecoveryPlan | None = None
+) -> tuple[list[tuple[str, int]], int, float]:
+    policy = manifest.get("peer_policy")
+    if not isinstance(policy, dict):
+        raise TypeError("explicit recovery peer policy is missing")
+    raw_peers = policy.get("peers")
+    required_votes = policy.get("required_votes")
+    query_timeout = policy.get("query_timeout")
+    if not isinstance(raw_peers, list):
+        raise TypeError("explicit recovery peer policy is malformed")
+    peers: list[tuple[str, int]] = []
+    for raw_peer in raw_peers:
+        if (
+            not isinstance(raw_peer, list)
+            or len(raw_peer) != 2
+            or not isinstance(raw_peer[0], str)
+            or not raw_peer[0]
+            or type(raw_peer[1]) is not int
+            or not 1 <= raw_peer[1] <= 65535
+        ):
+            raise RuntimeError("explicit recovery peer policy is malformed")
+        peers.append((raw_peer[0], raw_peer[1]))
+    labels = [f"{host}:{port}" for host, port in peers]
+    if len(set(labels)) != len(labels):
+        raise RuntimeError("explicit recovery peer policy contains duplicate peers")
+    if (
+        type(required_votes) is not int
+        or required_votes < 2
+        or required_votes > len(peers)
+        or isinstance(query_timeout, bool)
+        or not isinstance(query_timeout, (int, float))
+        or not 0 < float(query_timeout) <= 300
+    ):
+        raise RuntimeError("explicit recovery peer policy is malformed")
+    if plan is not None:
+        all_evidence = manifest.get("canonical_evidence")
+        evidence = (
+            all_evidence.get(str(plan.ancestor_height))
+            if isinstance(all_evidence, dict)
+            else None
+        )
+        if not isinstance(evidence, dict):
+            raise RuntimeError("explicit recovery target evidence is missing")
+        votes = evidence.get("votes")
+        errors = evidence.get("errors")
+        if not isinstance(votes, dict) or not isinstance(errors, dict):
+            raise RuntimeError("explicit recovery target evidence is malformed")
+        recorded_labels = set(votes) | set(errors)
+        if (
+            recorded_labels != set(labels)
+            or evidence.get("required_votes") != required_votes
+            or validate_sha224_hash(evidence.get("selected_hash"))
+            != plan.ancestor_hash
+        ):
+            raise RuntimeError("explicit recovery peer policy does not match target evidence")
+    return resolve_peer_endpoints(peers), required_votes, float(query_timeout)
 
 
 def classify_resume_tables(
@@ -1399,7 +1627,11 @@ def resume_journal_guard(
 
 
 def resume_recovery(
-    root: Path, config: object, paths: DbPaths, bundle_dir: Path
+    root: Path,
+    config: object,
+    paths: DbPaths,
+    bundle_dir: Path,
+    explicit_canonical_hash: Callable[[int], str] | None = None,
 ) -> int:
     manifest, plan, tail = load_resume_bundle(bundle_dir, paths)
     operation_id = str(manifest.get("operation_id"))
@@ -1446,6 +1678,18 @@ def resume_recovery(
                 raise RuntimeError(
                     "complete manifest contradicts current database state"
                 )
+            if (
+                manifest.get("selection_mode") == "explicit"
+                and all(state == "PRE" for state in states.values())
+            ):
+                if explicit_canonical_hash is None:
+                    raise RuntimeError(
+                        "explicit PRE resume requires canonical peer revalidation"
+                    )
+                if explicit_canonical_hash(plan.ancestor_height) != plan.ancestor_hash:
+                    raise RuntimeError(
+                        "explicit resume target no longer matches canonical peer evidence"
+                    )
             write_root_active_marker(root, bundle_dir)
             if manifest["status"] == "prepared":
                 mark_recovery_committing(bundle_dir)
@@ -1749,6 +1993,29 @@ def assert_hyper_retained_ancestor(
         )
 
 
+def explicit_resume_canonical_query(
+    root: Path, manifest: dict[str, object]
+) -> Callable[[int], str]:
+    peers, required_votes, query_timeout = parse_explicit_peer_policy(manifest)
+    rpc_module = import_upstream_module(root, "rpcconnections")
+    if hasattr(rpc_module, "LTIMEOUT"):
+        rpc_module.LTIMEOUT = query_timeout
+    connection_factory = timed_connection_factory(
+        rpc_module.Connection, query_timeout
+    )
+
+    def canonical(height: int) -> str:
+        return canonical_hash_at(
+            connection_factory,
+            peers,
+            height,
+            required_votes,
+            query_timeout=query_timeout,
+        ).selected_hash
+
+    return canonical
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bismuth-dir", default=".")
@@ -1758,9 +2025,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peer-file", default="suggested_peers.txt")
     parser.add_argument("--required-votes", type=int)
     parser.add_argument("--peer-timeout", type=float, default=10.0)
+    rollback_group = parser.add_mutually_exclusive_group()
+    rollback_group.add_argument(
+        "--rollback-to",
+        type=int,
+        metavar="HEIGHT",
+        help="retain HEIGHT and delete every later local block",
+    )
+    rollback_group.add_argument(
+        "--rollback-blocks",
+        type=int,
+        metavar="COUNT",
+        help="delete exactly COUNT blocks from the current local tip",
+    )
+    rollback_group.add_argument(
+        "--resume", metavar="BUNDLE", help="resume the exact active recovery bundle"
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--bundle-dir")
-    parser.add_argument("--resume")
     return parser
 
 
@@ -1798,6 +2080,15 @@ def run_cli(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 "root active marker operation ID does not match the recovery manifest"
             )
+        if resume_manifest.get("status") not in {"journal_guard", "journal_restored"}:
+            intent_digest = validate_manifest_recovery_intent(resume_manifest)
+            if (
+                intent_digest is not None
+                and active_marker.get("recovery_intent_sha256") != intent_digest
+            ):
+                raise RuntimeError(
+                    "root active marker recovery intent does not match the recovery manifest"
+                )
     assert_node_port_closed(int(config.port))
     assert_databases_offline(
         paths, allow_recovery_sidecars=bool(args.resume and active_marker)
@@ -1805,7 +2096,16 @@ def run_cli(args: argparse.Namespace) -> int:
     if resume_path is not None and resume_manifest is not None:
         if resume_manifest.get("status") in {"journal_guard", "journal_restored"}:
             return resume_journal_guard(root, config, paths, resume_path)
-        return resume_recovery(root, config, paths, resume_path)
+        explicit_canonical = None
+        if resume_manifest.get("selection_mode") == "explicit":
+            explicit_canonical = explicit_resume_canonical_query(root, resume_manifest)
+        return resume_recovery(
+            root,
+            config,
+            paths,
+            resume_path,
+            explicit_canonical_hash=explicit_canonical,
+        )
 
     peer_file = Path(args.peer_file).expanduser()
     if not peer_file.is_absolute():
@@ -1841,11 +2141,38 @@ def run_cli(args: argparse.Namespace) -> int:
     with open_local_ledger_readonly(paths.ledger) as ledger:
         tip_height, tip_hash = local_tip(ledger)
         assert_consistent_database_tip(paths, tip_height, tip_hash)
-        ancestor_height, ancestor_hash = find_common_ancestor(
-            lambda height: local_hash_at(ledger, height),
-            canonical,
-            tip_height,
-        )
+        explicit_target = args.rollback_to is not None or args.rollback_blocks is not None
+        if args.rollback_blocks is not None:
+            if args.rollback_blocks < 1:
+                raise ValueError("--rollback-blocks must be at least 1")
+            ancestor_height = tip_height - args.rollback_blocks
+            if ancestor_height < 1:
+                raise ValueError(
+                    "--rollback-blocks must leave at least block height 1 retained"
+                )
+        elif args.rollback_to is not None:
+            ancestor_height = args.rollback_to
+            if not 1 <= ancestor_height <= tip_height:
+                raise ValueError(
+                    f"--rollback-to must be between 1 and local tip {tip_height}"
+                )
+        else:
+            ancestor_height = -1
+        if explicit_target:
+            assert_explicit_reward_suffix(
+                paths, ledger, ancestor_height, tip_height
+            )
+            ancestor_hash = local_hash_at(ledger, ancestor_height)
+            if canonical(ancestor_height) != ancestor_hash:
+                raise RuntimeError(
+                    "explicit rollback target does not match canonical peer evidence"
+                )
+        else:
+            ancestor_height, ancestor_hash = find_common_ancestor(
+                lambda height: local_hash_at(ledger, height),
+                canonical,
+                tip_height,
+            )
     assert_hyper_retained_ancestor(paths, ancestor_height, ancestor_hash)
 
     plan = RecoveryPlan(
@@ -1859,7 +2186,8 @@ def run_cli(args: argparse.Namespace) -> int:
     mode = "APPLY" if args.apply else "DRY RUN"
     print(f"mode: {mode}")
     print(f"local tip: {plan.local_tip_height} {plan.local_tip_hash}")
-    print(f"common ancestor: {plan.ancestor_height} {plan.ancestor_hash}")
+    target_label = "rollback target" if explicit_target else "common ancestor"
+    print(f"{target_label}: {plan.ancestor_height} {plan.ancestor_hash}")
     print(
         f"rollback: {plan.first_delete_height}-{plan.local_tip_height} "
         f"({plan.rollback_blocks} blocks)"
@@ -1875,7 +2203,10 @@ def run_cli(args: argparse.Namespace) -> int:
         print("DRY RUN: no database changes made")
         return 0
     if plan.rollback_blocks == 0:
-        print("NO-OP: local tip already matches canonical peers")
+        if explicit_target:
+            print("NO-OP: requested retained height is the current local tip")
+        else:
+            print("NO-OP: local tip already matches canonical peers")
         return 0
 
     confirm_apply(plan)
@@ -1909,19 +2240,60 @@ def run_cli(args: argparse.Namespace) -> int:
                     f"local tip changed after planning: {current_tip}; rerun dry-run"
                 )
             current_ancestor_hash = local_hash_at(connection, plan.ancestor_height)
-            first_divergent_hash = local_hash_at(
-                connection, plan.first_delete_height
-            )
+            if explicit_target:
+                ledger_suffix = assert_contiguous_reward_suffix(
+                    connection,
+                    "main.transactions",
+                    plan.ancestor_height,
+                    plan.local_tip_height,
+                )
+                hyper_suffix = assert_contiguous_reward_suffix(
+                    connection,
+                    "hyperdb.transactions",
+                    plan.ancestor_height,
+                    plan.local_tip_height,
+                )
+                if ledger_suffix != hyper_suffix:
+                    raise RuntimeError(
+                        "ledger and hyper explicit rollback suffixes disagree"
+                    )
             canonical_ancestor_hash = canonical(plan.ancestor_height)
-            canonical_first_hash = canonical(plan.first_delete_height)
             if current_ancestor_hash != canonical_ancestor_hash:
                 raise RuntimeError(
                     "apply boundary failed: ancestor hash no longer agrees"
                 )
-            if first_divergent_hash == canonical_first_hash:
-                raise RuntimeError(
-                    "apply boundary failed: first divergent block now agrees"
+            if not explicit_target:
+                first_divergent_hash = local_hash_at(
+                    connection, plan.first_delete_height
                 )
+                canonical_first_hash = canonical(plan.first_delete_height)
+                if first_divergent_hash == canonical_first_hash:
+                    raise RuntimeError(
+                        "apply boundary failed: first divergent block now agrees"
+                    )
+            if args.rollback_blocks is not None:
+                rollback_request = {"blocks": args.rollback_blocks}
+            elif args.rollback_to is not None:
+                rollback_request = {"to_height": args.rollback_to}
+            else:
+                rollback_request = None
+            selection_mode = "explicit" if explicit_target else "automatic"
+            peer_policy = (
+                {
+                    "peers": [[host, port] for host, port in peers],
+                    "required_votes": required_votes,
+                    "query_timeout": args.peer_timeout,
+                }
+                if explicit_target
+                else None
+            )
+            write_root_active_marker(
+                root,
+                bundle,
+                recovery_intent_digest(
+                    selection_mode, rollback_request, peer_policy
+                ),
+            )
             write_recovery_bundle(
                 paths,
                 plan,
@@ -1930,6 +2302,9 @@ def run_cli(args: argparse.Namespace) -> int:
                 locked_connection=connection,
                 operation_id=operation_id,
                 original_journal_modes=locked.original_journal_modes,
+                selection_mode=selection_mode,
+                rollback_request=rollback_request,
+                peer_policy=peer_policy,
             )
             print(f"recovery bundle: {bundle}")
             mark_recovery_committing(bundle)

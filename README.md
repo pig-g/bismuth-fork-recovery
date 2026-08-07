@@ -1,8 +1,8 @@
 # Bismuth Fork Recovery
 
-Experimental, operator-run recovery tool for a stopped [Bismuth](https://github.com/bismuthfoundation/Bismuth) node that is stranded on a divergent chain below the node's automatic rollback checkpoint.
+Experimental, operator-run recovery tool for a stopped [Bismuth](https://github.com/bismuthfoundation/Bismuth) node that needs divergent-chain recovery or an intentional canonical suffix rewind.
 
-The tool finds the last block hash shared by the local ledger and multiple canonical peers, shows a dry-run plan, and—only after `--apply` plus exact confirmation—deletes the divergent tail from the offline databases using the same row boundaries as Bismuth's rollback methods.
+By default, the tool finds the last block hash shared by the local ledger and multiple canonical peers. It can also intentionally remove a canonical suffix down to an operator-selected height or by a selected block count. Every mode shows a dry-run plan and—only after `--apply` plus exact confirmation—deletes the selected tail from the offline databases using the same row boundaries as Bismuth's rollback methods.
 
 ## Safety contract
 
@@ -11,8 +11,8 @@ The tool finds the last block hash shared by the local ledger and multiple canon
 - A listening node port, matching `node.py` process, SQLite write lock, failed `quick_check`, or WAL/SHM sidecar aborts recovery.
 - A single peer is never sufficient. Each queried height requires at least two agreeing hashes.
 - Split or insufficient peer evidence aborts without mutation.
-- Before a plan is printed, ledger and hyper must each contain exactly one physical reward row at the retained ancestor, and both hashes must match canonical evidence.
-- Apply rechecks the local tip and both sides of the ancestor boundary.
+- Before a plan is printed, ledger and hyper must each contain exactly one physical reward row at the retained target, and both hashes must match canonical evidence.
+- Apply rechecks the unchanged local tip and retained target under exclusion. Automatic mode also rechecks the first divergent block; explicit mode intentionally permits that deleted block to be canonical.
 - Height `A` is preserved; deletion begins at `A + 1`.
 - Apply reserves the configured node port and keeps the maintenance guard active through finalization.
 - Ledger, hyper, and index are attached to one connection in `journal_mode=DELETE`, with `synchronous=FULL` and one `BEGIN EXCLUSIVE` transaction.
@@ -90,6 +90,33 @@ First inspect the dry-run plan. Then rerun with `--apply`:
 python3 fork_recovery.py --apply
 ```
 
+### Explicit rollback modes
+
+The default command performs automatic fork recovery. To retain an exact block height and delete everything after it:
+
+```bash
+# Retain height 1000; delete heights 1001 through the current local tip.
+python3 fork_recovery.py --rollback-to 1000
+```
+
+To remove an exact number of blocks from the current local tip:
+
+```bash
+# If the local tip is T, retain T-100 and delete T-99 through T.
+python3 fork_recovery.py --rollback-blocks 100
+```
+
+These options are mutually exclusive with each other and with `--resume`. `--rollback-blocks` must be positive and must leave at least height 1 retained; `--rollback-to` must be between height 1 and the current local tip. From the retained target through the local tip, ledger and hyper must contain the same contiguous, integer-height, duplicate-free reward-block interval, including matching hashes at every height, so `COUNT` always means exactly that many blocks. The local tip and interval are rechecked under the apply lock, so a tip or row change after planning aborts rather than shifting the requested boundary.
+
+Explicit rollback still requires multiple peers to agree that the retained target's hash is canonical. Ledger and hyper must each contain exactly one reward-bearing row at that height and must agree on the same hash. Unlike automatic fork recovery, the first deleted block is allowed to be canonical. After restart, the node can download that suffix again when canonical peers still serve the required range and normal synchronization permits it; this is not a guarantee under every peer-availability or checkpoint condition.
+
+Both commands above are dry-runs. After inspecting the exact target and deletion range, add `--apply` to perform the operation:
+
+```bash
+python3 fork_recovery.py --rollback-to 1000 --apply
+python3 fork_recovery.py --rollback-blocks 100 --apply
+```
+
 The tool prints an exact confirmation phrase such as:
 
 ```text
@@ -118,6 +145,8 @@ python3 fork_recovery.py \
 ```
 
 Resume requires the root `.fork_recovery_active.json` marker, an exact match between its bundle path and `--resume`, a matching marker/manifest operation ID, and an exact `RESUME <operation-id>` confirmation. A `journal_guard`-only resume restores journal modes and exits without changing blockchain rows; the operator must rerun a dry-run. A full resume verifies the tail digest, exact database paths/inodes, schemas, retained contents, ancestor, and original journal modes. Each targeted table must be exactly PRE (matches the archive) or POST (no rollback rows remain). PRE/POST mixtures are completed with idempotent deletes; any UNKNOWN state aborts without mutation.
+
+An explicit rollback bundle also persists its exact peer policy and binds it to the target evidence. Selection mode, rollback request, and peer policy are canonicalized into a recovery-intent digest that is independently bound by the root active marker before the prepared manifest is installed; resume rejects either a manifest self-digest mismatch or a root/manifest intent mismatch. Resume re-resolves the peer policy and rejects textual or resolved endpoint aliases before it can count votes. If every targeted table is still PRE, resume refreshes target quorum under exclusion before the first resumed delete; a changed chain view, unavailable quorum, malformed response, or timeout aborts without mutation. Once any table is already POST, resume follows the immutable bundle plan deterministically instead of making crash recovery depend on current network availability.
 
 After success, restart the unchanged node yourself:
 

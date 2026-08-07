@@ -711,6 +711,29 @@ def test_write_recovery_bundle_exports_only_rows_that_will_be_deleted(tmp_path):
     assert [row[0] for row in tail["ledger"]["transactions"]["rows"]] == [6, -6]
     assert [row[0] for row in tail["index"]["tokens"]["rows"]] == [6]
 
+    manifest["selection_mode"] = "explicit"
+    manifest["rollback_request"] = {"blocks": 4}
+    manifest["recovery_intent_sha256"] = tool.recovery_intent_digest(
+        "explicit", manifest["rollback_request"], manifest["peer_policy"]
+    )
+    (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="rollback request does not match recovery plan"):
+        tool.load_resume_bundle(bundle, tool.DbPaths(ledger, hyper, index))
+
+
+def test_explicit_resume_peer_policy_rejects_resolved_endpoint_aliases():
+    tool = load_tool()
+    manifest = {
+        "peer_policy": {
+            "peers": [["localhost", 5658], ["127.0.0.1", 5658]],
+            "required_votes": 2,
+            "query_timeout": 1.0,
+        }
+    }
+
+    with pytest.raises(ValueError, match="duplicate resolved peer endpoint"):
+        tool.parse_explicit_peer_policy(manifest)
+
 
 def create_fake_bismuth_root(tmp_path):
     root = tmp_path / "Bismuth"
@@ -812,6 +835,491 @@ def test_cli_defaults_to_dry_run_and_leaves_databases_unchanged(tmp_path):
     assert f"common ancestor: 5 {valid_hash('shared-5')}" in result.stdout
     with sqlite3.connect(root / "static/ledger.db") as conn:
         assert conn.execute("SELECT MAX(block_height) FROM transactions").fetchone() == (10,)
+
+
+def test_cli_rollback_blocks_dry_run_retains_tip_minus_count(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN" in result.stdout
+    assert f"rollback target: 8 {valid_hash('main-8')}" in result.stdout
+    assert "rollback: 9-10 (2 blocks)" in result.stdout
+    with sqlite3.connect(root / "static/ledger.db") as connection:
+        assert connection.execute(
+            "SELECT MAX(block_height) FROM transactions"
+        ).fetchone() == (10,)
+
+
+def test_cli_help_describes_automatic_and_explicit_rollback_modes():
+    result = subprocess.run(
+        [sys.executable, str(TOOL_PATH), "--help"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "automatic and explicit rollback" in result.stdout
+
+
+def test_cli_rollback_to_dry_run_retains_requested_height(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-to",
+            "7",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN" in result.stdout
+    assert f"rollback target: 7 {valid_hash('main-7')}" in result.stdout
+    assert "rollback: 8-10 (3 blocks)" in result.stdout
+    with sqlite3.connect(root / "static/ledger.db") as connection:
+        assert connection.execute(
+            "SELECT MAX(block_height) FROM transactions"
+        ).fetchone() == (10,)
+
+
+def test_cli_rollback_blocks_apply_deletes_exact_suffix(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    bundle = tmp_path / "explicit-rollback-bundle"
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.execute(
+                "INSERT INTO transactions VALUES (?, ?, ?)",
+                (-9, "0", valid_hash("negative-9")),
+            )
+            connection.executemany(
+                "INSERT INTO misc VALUES (?, ?)", [(8, "keep-8"), (9, "delete-9")]
+            )
+            connection.commit()
+    with sqlite3.connect(root / "static/index.db") as connection:
+        connection.executemany("INSERT INTO tokens VALUES (?)", [(8,), (9,)])
+        connection.executemany("INSERT INTO aliases VALUES (?)", [(8,), (9,)])
+        connection.commit()
+
+    confirmation = f"ROLLBACK 9-10 TO 8 {valid_hash('main-8')}\n"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "2",
+            "--apply",
+            "--bundle-dir",
+            str(bundle),
+        ],
+        input=confirmation,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "RECOVERY COMPLETE" in result.stdout
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            assert connection.execute(
+                "SELECT MAX(block_height) FROM transactions WHERE reward != 0"
+            ).fetchone() == (8,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM transactions "
+                "WHERE block_height >= 9 OR block_height <= -9"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM misc WHERE block_height >= 9"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM misc WHERE block_height = 8"
+            ).fetchone() == (1,)
+    with sqlite3.connect(root / "static/index.db") as connection:
+        for table in ("tokens", "aliases"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE block_height >= 9"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE block_height = 8"
+            ).fetchone() == (1,)
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["selection_mode"] == "explicit"
+    assert manifest["rollback_request"] == {"blocks": 2}
+    assert manifest["ancestor_height"] == 8
+    assert manifest["first_delete_height"] == 9
+    assert manifest["rollback_blocks"] == 2
+
+
+def test_cli_rollback_to_current_tip_apply_is_no_op(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    bundle = tmp_path / "must-not-exist"
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-to",
+            "10",
+            "--apply",
+            "--bundle-dir",
+            str(bundle),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "NO-OP: requested retained height is the current local tip" in result.stdout
+    assert not bundle.exists()
+    assert not (root / ".fork_recovery_active.json").exists()
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            assert connection.execute(
+                "SELECT MAX(block_height) FROM transactions WHERE reward != 0"
+            ).fetchone() == (10,)
+
+
+def test_cli_explicit_rollback_rejects_noncanonical_retained_target(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "explicit rollback target does not match canonical peer evidence" in result.stderr
+    with sqlite3.connect(root / "static/ledger.db") as connection:
+        assert connection.execute(
+            "SELECT MAX(block_height) FROM transactions"
+        ).fetchone() == (10,)
+
+
+def test_cli_rollback_blocks_rejects_gapped_reward_suffix(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.execute(
+                "DELETE FROM transactions WHERE block_height = 9 AND reward != 0"
+            )
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "explicit rollback requires a contiguous reward-block suffix" in result.stderr
+
+
+def test_cli_explicit_rollback_rejects_ledger_hyper_suffix_hash_mismatch(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                block_hash = valid_hash(f"main-{height}")
+                if database_name == "hyper.db" and height == 9:
+                    block_hash = valid_hash("hyper-mismatch-9")
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (block_hash, height),
+                )
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "ledger and hyper explicit rollback suffixes disagree" in result.stderr
+
+
+def test_cli_rollback_blocks_rejects_nonintegral_reward_height(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.execute(
+                "UPDATE transactions SET block_height = 8.5 WHERE block_height = 9"
+            )
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "3",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "contiguous integer reward-block interval" in result.stderr
+
+
+def test_cli_explicit_rollback_rejects_real_retained_height(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    for database_name in ("ledger.db", "hyper.db"):
+        with sqlite3.connect(root / "static" / database_name) as connection:
+            connection.execute("ALTER TABLE transactions RENAME TO transactions_typed")
+            connection.execute(
+                "CREATE TABLE transactions "
+                "(block_height, reward TEXT, block_hash TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO transactions SELECT * FROM transactions_typed"
+            )
+            connection.execute("DROP TABLE transactions_typed")
+            for height in range(6, 11):
+                connection.execute(
+                    "UPDATE transactions SET block_hash = ? WHERE block_height = ?",
+                    (valid_hash(f"main-{height}"), height),
+                )
+            connection.execute(
+                "UPDATE transactions SET block_height = CAST(8.0 AS REAL) "
+                "WHERE block_height = 8"
+            )
+            assert connection.execute(
+                "SELECT typeof(block_height) FROM transactions WHERE block_height = 8"
+            ).fetchone() == ("real",)
+            connection.commit()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            "--rollback-blocks",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "contiguous integer reward-block interval" in result.stderr
+
+
+def test_explicit_reward_suffix_rejects_duplicate_reward_height():
+    tool = load_tool()
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.execute(
+            "CREATE TABLE transactions "
+            "(block_height INTEGER, reward NUMERIC, block_hash TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO transactions VALUES (?, ?, ?)",
+            [
+                (9, 1, valid_hash("main-9")),
+                (9, -1, valid_hash("duplicate-9")),
+                (10, 1, valid_hash("main-10")),
+            ],
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="explicit rollback requires a contiguous reward-block suffix",
+        ):
+            tool.assert_contiguous_reward_suffix(connection, "transactions", 8, 10)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--rollback-blocks", "0"), "--rollback-blocks must be at least 1"),
+        (
+            ("--rollback-blocks", "10"),
+            "--rollback-blocks must leave at least block height 1 retained",
+        ),
+        (("--rollback-to", "0"), "--rollback-to must be between 1 and local tip 10"),
+        (("--rollback-to", "11"), "--rollback-to must be between 1 and local tip 10"),
+    ],
+)
+def test_cli_explicit_rollback_rejects_invalid_range(tmp_path, arguments, message):
+    root = create_fake_bismuth_root(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--required-votes",
+            "2",
+            *arguments,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert message in result.stderr
+
+
+def test_cli_explicit_rollback_options_are_mutually_exclusive(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--rollback-to",
+            "5",
+            "--rollback-blocks",
+            "5",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr
+
+
+def test_cli_explicit_rollback_option_is_mutually_exclusive_with_resume(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--rollback-blocks",
+            "2",
+            "--resume",
+            str(tmp_path / "bundle"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1175,6 +1683,120 @@ def test_cli_resume_committing_bundle_before_peer_planning(tmp_path):
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
     assert not (bundle / "ACTIVE").exists()
+
+
+@pytest.mark.parametrize(
+    ("peer_prefix", "downgrade_manifest", "expected_returncode", "expected_tip", "error"),
+    [
+        (
+            "changed-",
+            False,
+            1,
+            10,
+            "explicit resume target no longer matches canonical peer evidence",
+        ),
+        ("shared-", False, 0, 5, None),
+        ("changed-", True, 1, 10, "recovery intent"),
+    ],
+)
+def test_cli_explicit_pre_resume_refreshes_retained_target_quorum(
+    tmp_path,
+    peer_prefix,
+    downgrade_manifest,
+    expected_returncode,
+    expected_tip,
+    error,
+):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    paths = tool.DbPaths(
+        root / "static/ledger.db",
+        root / "static/hyper.db",
+        root / "static/index.db",
+    )
+    plan = tool.RecoveryPlan(
+        10,
+        valid_hash("fork-10"),
+        5,
+        valid_hash("shared-5"),
+        6,
+        5,
+    )
+    bundle = tmp_path / "explicit-pre-bundle"
+    tool.write_recovery_bundle(paths, plan, bundle)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["selection_mode"] = "explicit"
+    manifest["rollback_request"] = {"to_height": 5}
+    manifest["peer_policy"] = {
+        "peers": [["192.0.2.10", 5658], ["198.51.100.7", 5658]],
+        "required_votes": 2,
+        "query_timeout": 1.0,
+    }
+    manifest["canonical_evidence"] = {
+        "5": {
+            "selected_hash": valid_hash("shared-5"),
+            "required_votes": 2,
+            "votes": {
+                "192.0.2.10:5658": valid_hash("shared-5"),
+                "198.51.100.7:5658": valid_hash("shared-5"),
+            },
+            "errors": {},
+        }
+    }
+    manifest["recovery_intent_sha256"] = tool.recovery_intent_digest(
+        manifest["selection_mode"],
+        manifest["rollback_request"],
+        manifest["peer_policy"],
+    )
+    tool.write_manifest_atomic(manifest_path, manifest)
+    tool.write_root_active_marker(root, bundle)
+    if downgrade_manifest:
+        manifest["selection_mode"] = "automatic"
+        manifest["rollback_request"] = None
+        manifest["peer_policy"] = None
+        manifest["recovery_intent_sha256"] = tool.recovery_intent_digest(
+            "automatic", None, None
+        )
+        tool.write_manifest_atomic(manifest_path, manifest)
+    (root / "rpcconnections.py").write_text(
+        "import hashlib\n"
+        "class Connection:\n"
+        "    def __init__(self, peer): self.peer = peer\n"
+        "    def command(self, command, options):\n"
+        "        height = int(options[0])\n"
+        f"        value = hashlib.sha224(({peer_prefix!r} + str(height)).encode()).hexdigest()\n"
+        "        return {str(height): {'block_hash': value}}\n"
+        "    def close(self): pass\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--apply",
+            "--resume",
+            str(bundle),
+        ],
+        input=f"RESUME {manifest['operation_id']}\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode, result.stderr
+    if expected_returncode:
+        assert error in result.stderr
+    else:
+        assert "RECOVERY RESUME COMPLETE" in result.stdout
+    for database in (paths.ledger, paths.hyper):
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT MAX(block_height) FROM transactions WHERE reward != 0"
+            ).fetchone() == (expected_tip,)
 
 
 def test_cli_resume_rejects_missing_root_active_marker(tmp_path):
