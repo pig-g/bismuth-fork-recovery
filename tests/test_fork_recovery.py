@@ -274,6 +274,100 @@ def test_find_common_ancestor_rejects_chain_with_no_retained_match():
         )
 
 
+def test_find_common_ancestor_synthetic_fork_e2e(tmp_path):
+    """E2E: a real divergent SQLite ledger + real peer-RPC quorum must resolve
+    the true fork point through find_common_ancestor, with a bounded number of
+    RPC probes.
+
+    This is the missing integration seam: earlier unit tests feed plain dicts,
+    so they prove the bracketing/binary logic and the quorum logic separately,
+    but not that the automatic mode wired over a real ledger and the real
+    peer protocol actually finds the shared ancestor of a synthetic fork.
+    """
+    tool = load_tool()
+
+    # Chain layout: blocks 1..ANCESTOR are shared, blocks above diverge.
+    ancestor = 5000
+    local_tip = 5300  # local chain forked 300 blocks after the shared point
+    canonical_tip = 5450
+    assert ancestor < local_tip < canonical_tip
+
+    shared_hashes = {h: valid_hash(f"shared-{h}") for h in range(1, ancestor + 1)}
+    local_hashes = {h: valid_hash(f"fork-{h}") for h in range(ancestor + 1, local_tip + 1)}
+    canonical_hashes = {h: valid_hash(f"main-{h}") for h in range(ancestor + 1, canonical_tip + 1)}
+
+    # Build a real SQLite ledger with the LOCAL divergent chain.
+    ledger = tmp_path / "ledger.db"
+    conn = sqlite3.connect(ledger)
+    conn.execute(
+        "CREATE TABLE transactions (block_height INTEGER, reward INTEGER, block_hash TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO transactions VALUES (?, 1, ?)",
+        [
+            (h, shared_hashes[h])
+            for h in sorted(shared_hashes)
+        ]
+        + [
+            (h, local_hashes[h])
+            for h in sorted(local_hashes)
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    # Fake peers serving the CANONICAL chain over the real RPC protocol
+    # (api_getblockfromheight). Two peers both report canonical, so a
+    # required_votes=2 quorum agrees.
+    peers = [("a", 5658), ("b", 5658)]
+    queried_heights = []
+
+    class ForkE2EConnection:
+        def __init__(self, peer):
+            self.peer = peer
+            self.closed = False
+
+        def command(self, command, options):
+            assert command == "api_getblockfromheight"
+            height = options[0]
+            queried_heights.append(height)
+            if height in shared_hashes:
+                block_hash = shared_hashes[height]
+            elif height in canonical_hashes:
+                block_hash = canonical_hashes[height]
+            else:
+                raise ValueError(f"peer has no block at height {height}")
+            return {str(height): {"block_hash": block_hash}}
+
+        def close(self):
+            self.closed = True
+
+    with tool.open_local_ledger_readonly(ledger) as db:
+        local_tip_height, local_tip_hash = tool.local_tip(db)
+        assert local_tip_height == local_tip
+
+        def canonical(height):
+            evidence = tool.canonical_hash_at(
+                ForkE2EConnection,
+                peers,
+                height=height,
+                required_votes=2,
+            )
+            return evidence.selected_hash
+
+        found_ancestor, found_hash = tool.find_common_ancestor(
+            lambda height: tool.local_hash_at(db, height),
+            canonical,
+            local_tip_height,
+        )
+
+    # The true fork point must be recovered, with its shared hash.
+    assert (found_ancestor, found_hash) == (ancestor, shared_hashes[ancestor])
+    # The search must not scan every height: bucketing + binary search stays
+    # logarithmic-ish in fork depth (a handful of probes, not 300+).
+    assert len(set(queried_heights)) < 40
+
+
 def test_apply_existing_rollbacks_deletes_from_ancestor_plus_one():
     tool = load_tool()
     calls = []
@@ -505,7 +599,9 @@ def test_probe_reachable_peers_filters_dead_peers(tmp_path):
 
         return _Conn(peer in live)
 
-    assert tool.probe_reachable_peers(factory, peers, height=100, timeout=2.0) == live
+    # probe_reachable_peers returns peers in thread-pool completion order,
+    # which is nondeterministic; compare as a set, not an ordered list.
+    assert set(tool.probe_reachable_peers(factory, peers, height=100, timeout=2.0)) == set(live)
 
 
 def test_canonical_hash_at_parallel_and_caches_dead_peers(tmp_path):

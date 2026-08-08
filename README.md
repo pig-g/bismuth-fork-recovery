@@ -214,6 +214,8 @@ BISMUTH_SOURCE_DIR=/tmp/Bismuth python3 -m pytest tests/ -q
 
 The integration test uses temporary synthetic SQLite databases. It never applies recovery to a live or mainnet database.
 
+Automatic-mode ancestor discovery is covered by a synthetic-fork end-to-end test: it builds a real divergent SQLite ledger (shared blocks below the fork point, a local fork above it), serves the canonical chain over the real `api_getblockfromheight` peer protocol with a quorum, and asserts `find_common_ancestor` recovers the true fork point with a bounded (logarithmic-ish) number of RPC probes — no real network required.
+
 ## Status and limitations
 
 - Compatibility is tested against a clean Foundation upstream checkout.
