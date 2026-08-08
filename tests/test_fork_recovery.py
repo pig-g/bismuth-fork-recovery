@@ -104,6 +104,39 @@ def test_local_tip_rejects_conflicting_reward_rows_at_tip(tmp_path):
         tool.local_tip(readonly)
 
 
+def test_recovery_retained_verification_is_bounded_to_window(tmp_path):
+    # Regression: retained verification must NOT fingerprint the whole DB.
+    # Only rows within RETAINED_WINDOW below the boundary are retained/checked,
+    # so a rollback stays O(window) even on a very large observer DB. If a
+    # future change reverts to ``WHERE block_height < boundary`` (full scan),
+    # the far-lower genesis row below would be included and this test fails.
+    tool = load_tool()
+    ledger = tmp_path / "ledger.db"
+    conn = sqlite3.connect(ledger)
+    conn.execute(
+        "CREATE TABLE transactions (block_height INTEGER, reward TEXT, block_hash TEXT)"
+    )
+    boundary = tool.RETAINED_WINDOW + 100_000
+    conn.executemany(
+        "INSERT INTO transactions VALUES (?, ?, ?)",
+        [(1, "1", "genesis-deep-below"), (boundary - 1, "1", "near-ancestor")],
+    )
+    conn.commit()
+    conn.close()
+
+    entry = next(
+        spec for spec in tool.recovery_table_specs(boundary)
+        if spec[0] == "ledger.transactions"
+    )
+    _, _database, _schema, _table, _locked_query, params, standalone_query = entry
+    with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True) as connection:
+        heights = [row[0] for row in connection.execute(standalone_query, params)]
+
+    # Only the ancestor window is retained; the deep-below genesis row is not
+    # scanned (O(window) bound preserved).
+    assert heights == [boundary - 1]
+
+
 def test_canonical_hash_requires_majority_and_closes_connections():
     tool = load_tool()
     responses = {
@@ -2109,6 +2142,7 @@ def test_local_manual_apply_runs_one_pre_and_one_post_integrity_cycle(
                 "--apply",
                 "--bundle-dir",
                 str(bundle),
+                "--integrity-check",
             ]
         )
     )
@@ -2117,7 +2151,47 @@ def test_local_manual_apply_runs_one_pre_and_one_post_integrity_cycle(
     quick_checks = [
         statement for statement in statements if "quick_check" in statement.casefold()
     ]
+    # With --integrity-check the tool runs one pre + one post full b-tree scan
+    # across all three schemas (3 x 2 = 6 PRAGMA quick_check statements).
     assert len(quick_checks) == 6
+
+
+def test_local_manual_apply_skips_full_integrity_scan_by_default(tmp_path, monkeypatch):
+    # The default fast path must NOT run a whole-DB b-tree scan: a tail rollback
+    # is atomic, so retained-data safety is provided by the exclusive locks,
+    # ancestor/tip hash checks and journaling rather than a minutes-long
+    # PRAGMA quick_check over millions of rows.
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    bundle = tmp_path / "fast-bundle"
+    statements = []
+    original_connect = tool.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(tool.sqlite3, "connect", recording_connect)
+    monkeypatch.setattr(tool, "confirm_apply", lambda _plan: None)
+    result = tool.run_cli(
+        tool.build_parser().parse_args(
+            [
+                "--bismuth-dir",
+                str(root),
+                "--rollback-blocks",
+                "2",
+                "--apply",
+                "--bundle-dir",
+                str(bundle),
+            ]
+        )
+    )
+
+    assert result == 0
+    assert not any(
+        "quick_check" in statement.casefold() for statement in statements
+    )
 
 
 def test_cli_resume_rejects_missing_root_active_marker(tmp_path):

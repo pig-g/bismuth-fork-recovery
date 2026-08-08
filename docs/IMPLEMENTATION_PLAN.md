@@ -25,10 +25,10 @@ Deliver a standalone `fork_recovery.py` that can be downloaded into, or pointed 
 9. Reserve the configured node port; reject matching/ambiguous `node.py` processes.
 10. Attach ledger, hyper, and index in fixed order, read their current journal modes, and fsync a `journal_guard` manifest with exact DB identities before the first mode change.
 11. Force DELETE journals, FULL synchronous mode, and acquire one `BEGIN EXCLUSIVE` transaction without an implicit integrity rescan in the lock helper.
-12. Re-run the process check and perform the single full pre-mutation integrity cycle plus local tip and `A`/`A+1` boundary validation under exclusion.
-13. Export the exact rollback tail and fsync a `prepared` manifest with database identities, schema signatures, and retained/targeted fingerprints.
+12. Re-run the process check and perform the local tip and `A`/`A+1` boundary validation under exclusion; perform the single full pre-mutation integrity cycle only when `--integrity-check` is set.
+13. Export the exact rollback tail and a bounded retained window, then fsync a `prepared` manifest with database identities, schema signatures, and targeted/bounded-retained fingerprints.
 14. Persist `committing`, then apply direct idempotent deletes matching upstream `rollback_under`, token, and alias boundaries.
-15. Perform the single full post-mutation integrity cycle, validate the resulting tip and absence of rollback-range rows inside the transaction, then commit last and immediately reacquire exclusion.
+15. Validate the resulting tip and absence of rollback-range rows inside the transaction, perform the full post-mutation integrity cycle only when `--integrity-check` is set, then commit last and immediately reacquire exclusion.
 16. Revalidate committed logical postconditions and metadata without a duplicate full-page scan, then durably mark `restoring` while exclusion is still held.
 17. Restore and verify all original journal modes, reacquire write exclusion, and revalidate metadata/postconditions without another duplicate full-page scan.
 18. Only then mark the bundle `complete`, remove active markers, and tell the operator to restart the unchanged node.

@@ -27,6 +27,14 @@ from typing import Callable, NamedTuple
 
 ROOT_ACTIVE_MARKER = ".fork_recovery_active.json"
 DATABASE_NAMES = ("ledger", "hyper", "index")
+# When False (the default) the full SQLite structural scan (PRAGMA quick_check)
+# is skipped. A tail rollback is a single atomic SQLite transaction that never
+# touches retained pages, so a whole-DB page scan is not required for the
+# rollback itself: retained-data safety comes from the exclusive locks, the
+# ancestor/tip hash checks, the journal guard and normal WAL/journal atomicity.
+# Pass --integrity-check to also run the full pre/post b-tree integrity scan
+# (detects pre-existing external corruption) at the cost of minutes on a large DB.
+INTEGRITY_CHECK = False
 SQLITE_SCHEMAS = ("main", "hyperdb", "indexdb")
 
 
@@ -644,61 +652,73 @@ def _export_attached_rows(
     return {"columns": columns, "rows": rows}
 
 
+# Rollback only ever mutates the tail [boundary, tip]. The retained rows
+# strictly below boundary are protected by the exclusive DB locks, the
+# ancestor/tip hash checks and normal SQLite journaling — so verifying the
+# whole retained database with a full read + JSON + sha256 pass is redundant
+# and is the dominant cost on large observer DBs. We verify only a small
+# bounded window of retained rows just below the boundary. This keeps a
+# rollback of a very large DB O(window) instead of O(full DB), while still
+# catching boundary-region tampering (see test_cli_resume_rejects_changed_retained_history).
+RETAINED_WINDOW = 256
+
+
 def recovery_table_specs(boundary: int):
+    low = boundary - RETAINED_WINDOW
     return (
         (
             "ledger.transactions",
             "ledger",
             "main",
             "transactions",
-            "SELECT * FROM main.transactions WHERE block_height < ? AND block_height > ? ORDER BY rowid",
-            (boundary, -boundary),
-            "SELECT * FROM transactions WHERE block_height < ? AND block_height > ? ORDER BY rowid",
+            "SELECT * FROM main.transactions WHERE block_height >= ? AND block_height < ? AND block_height > ? ORDER BY rowid",
+            (low, boundary, -boundary),
+            "SELECT * FROM transactions WHERE block_height >= ? AND block_height < ? AND block_height > ? ORDER BY rowid",
         ),
         (
             "ledger.misc",
             "ledger",
             "main",
             "misc",
-            "SELECT * FROM main.misc WHERE block_height < ? ORDER BY rowid",
-            (boundary,),
-            "SELECT * FROM misc WHERE block_height < ? ORDER BY rowid",
+            "SELECT * FROM main.misc WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
+            (low, boundary),
+            "SELECT * FROM misc WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
         ),
         (
             "hyper.transactions",
             "hyper",
             "hyperdb",
             "transactions",
-            "SELECT * FROM hyperdb.transactions WHERE block_height < ? AND block_height > ? ORDER BY rowid",
-            (boundary, -boundary),
-            "SELECT * FROM transactions WHERE block_height < ? AND block_height > ? ORDER BY rowid",
+            "SELECT * FROM hyperdb.transactions WHERE block_height >= ? AND block_height < ? AND block_height > ? ORDER BY rowid",
+            (low, boundary, -boundary),
+            "SELECT * FROM transactions WHERE block_height >= ? AND block_height < ? AND block_height > ? ORDER BY rowid",
         ),
         (
             "hyper.misc",
             "hyper",
             "hyperdb",
             "misc",
-            "SELECT * FROM hyperdb.misc WHERE block_height < ? ORDER BY rowid",
-            (boundary,),
-            "SELECT * FROM misc WHERE block_height < ? ORDER BY rowid",
+            "SELECT * FROM hyperdb.misc WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
+            (low, boundary),
+            "SELECT * FROM misc WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
         ),
         (
             "index.tokens",
             "index",
             "indexdb",
             "tokens",
-            "SELECT * FROM indexdb.tokens WHERE block_height < ? ORDER BY rowid",
-            (boundary,),
-            "SELECT * FROM tokens WHERE block_height < ? ORDER BY rowid",
+            "SELECT * FROM indexdb.tokens WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
+            (low, boundary),
+            "SELECT * FROM tokens WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
         ),
         (
             "index.aliases",
             "index",
             "indexdb",
             "aliases",
-            "SELECT * FROM indexdb.aliases WHERE block_height < ? ORDER BY rowid",
-            (boundary,),
-            "SELECT * FROM aliases WHERE block_height < ? ORDER BY rowid",
+            "SELECT * FROM indexdb.aliases WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
+            (low, boundary),
+            "SELECT * FROM aliases WHERE block_height >= ? AND block_height < ? ORDER BY rowid",
         ),
     )
 
@@ -1099,11 +1119,14 @@ def complete_recovery_bundle(bundle_dir: Path, root: Path | None = None) -> None
 
 
 def assert_post_recovery(paths: DbPaths, plan: RecoveryPlan) -> None:
-    for path in paths:
-        with open_local_ledger_readonly(path) as connection:
-            check = connection.execute("PRAGMA quick_check").fetchone()
-            if check != ("ok",):
-                raise RuntimeError(f"post-recovery quick_check failed for {path}: {check}")
+    if INTEGRITY_CHECK:
+        for path in paths:
+            with open_local_ledger_readonly(path) as connection:
+                check = connection.execute("PRAGMA quick_check").fetchone()
+                if check != ("ok",):
+                    raise RuntimeError(
+                        f"post-recovery quick_check failed for {path}: {check}"
+                    )
 
     with open_local_ledger_readonly(paths.ledger) as ledger:
         tip = local_tip(ledger)
@@ -1135,7 +1158,7 @@ def assert_post_recovery_locked(
     plan: RecoveryPlan,
     check_integrity: bool = True,
 ) -> None:
-    if check_integrity:
+    if check_integrity and INTEGRITY_CHECK:
         for schema in ("main", "hyperdb", "indexdb"):
             check = connection.execute(f"PRAGMA {schema}.quick_check").fetchone()
             if check != ("ok",):
@@ -1249,6 +1272,8 @@ def attached_hash_at(
 
 
 def assert_locked_integrity(connection: sqlite3.Connection) -> None:
+    if not INTEGRITY_CHECK:
+        return
     quick_checks = {
         "main": "PRAGMA main.quick_check",
         "hyperdb": "PRAGMA hyperdb.quick_check",
@@ -2062,10 +2087,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--bundle-dir")
+    parser.add_argument(
+        "--integrity-check",
+        action="store_true",
+        help=(
+            "also run the full SQLite b-tree integrity scan (PRAGMA quick_check) "
+            "before and after the rollback; costs minutes on a large DB and is "
+            "off by default because a tail rollback is atomic"
+        ),
+    )
     return parser
 
 
 def run_cli(args: argparse.Namespace) -> int:
+    global INTEGRITY_CHECK
+    INTEGRITY_CHECK = bool(args.integrity_check)
     explicit_target = args.rollback_to is not None or args.rollback_blocks is not None
     explicit_peer_options = (
         args.verify_peers
@@ -2123,7 +2159,7 @@ def run_cli(args: argparse.Namespace) -> int:
     assert_databases_offline(
         paths,
         allow_recovery_sidecars=bool(args.resume and active_marker),
-        check_integrity=not args.apply,
+        check_integrity=False,
     )
     if resume_path is not None and resume_manifest is not None:
         if resume_manifest.get("status") in {"journal_guard", "journal_restored"}:
