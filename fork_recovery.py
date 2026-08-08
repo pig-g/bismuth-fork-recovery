@@ -19,6 +19,7 @@ import sys
 import threading
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,12 +184,11 @@ def probe_reachable_peers(
     returns a parseable block hash within ``timeout``.
     """
     reachable: list[tuple[str, int]] = []
-    for peer in peers:
-        try:
-            query_peer_hash_with_deadline(connection_factory, peer, height, timeout)
-            reachable.append(peer)
-        except Exception:  # noqa: BLE001 - a dead peer is just excluded
-            continue
+    results = _query_peers_parallel(connection_factory, peers, height, timeout)
+    by_label = {f'{peer[0]}:{peer[1]}': peer for peer in peers}
+    for label, (value, _error) in results.items():
+        if value is not None:
+            reachable.append(by_label[label])
     return reachable
 
 
@@ -557,25 +557,77 @@ def _block_hash_from_response(response: object, height: int) -> str:
     return validate_sha224_hash(block["block_hash"])
 
 
+def _query_peers_parallel(
+    connection_factory,
+    peers: list[tuple[str, int]],
+    height: int,
+    timeout: float,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Query all peers for one height concurrently.
+
+    Returns ``{label: (hash_or_None, error_or_None)}``. Each peer runs in its
+    own worker (each still bounded by the per-peer deadline inside
+    :func:`query_peer_hash_with_deadline`), so one slow or dead peer cannot
+    stall the others: the whole pass finishes in roughly one timeout instead of
+    ``len(peers) * timeout``.
+    """
+    results: dict[str, tuple[str | None, str | None]] = {}
+    lock = threading.Lock()
+
+    def work(peer: tuple[str, int]) -> None:
+        label = f"{peer[0]}:{peer[1]}"
+        try:
+            value = query_peer_hash_with_deadline(
+                connection_factory, peer, height, timeout
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate untrusted peer failure
+            with lock:
+                results[label] = (None, str(exc))
+        else:
+            with lock:
+                results[label] = (value, None)
+
+    workers = max(1, min(len(peers), 12))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(work, peers))
+    return results
+
+
 def canonical_hash_at(
     connection_factory,
     peers: list[tuple[str, int]],
     height: int,
     required_votes: int,
     query_timeout: float = 10.0,
+    dead_peers: set[str] | None = None,
 ) -> CanonicalHashEvidence:
-    """Query peers for one height and require an explicit hash vote threshold."""
+    """Query peers for one height in parallel and require a hash vote threshold.
+
+    Peers already recorded in ``dead_peers`` (by label) are skipped without
+    being queried again, preventing a known-dead peer from re-consuming the
+    full timeout on every ancestor-search height.
+    """
     votes: dict[str, str | None] = {}
     errors: dict[str, str] = {}
-    for peer in peers:
-        label = f"{peer[0]}:{peer[1]}"
-        try:
-            votes[label] = query_peer_hash_with_deadline(
-                connection_factory, peer, height, query_timeout
-            )
-        except Exception as exc:  # noqa: BLE001 - isolate each untrusted peer failure
-            votes[label] = None
-            errors[label] = str(exc)
+    to_query = peers
+    if dead_peers:
+        to_query = [
+            peer for peer in peers if f"{peer[0]}:{peer[1]}" not in dead_peers
+        ]
+        for peer in peers:
+            label = f"{peer[0]}:{peer[1]}"
+            if label in dead_peers:
+                votes[label] = None
+                errors[label] = "peer unreachable (cached)"
+    results = _query_peers_parallel(
+        connection_factory, to_query, height, query_timeout
+    )
+    for label, (value, error) in results.items():
+        votes[label] = value
+        if error is not None:
+            errors[label] = error
+            if dead_peers is not None:
+                dead_peers.add(label)
 
     counts = Counter(value for value in votes.values() if value is not None)
     if not counts:
@@ -2325,6 +2377,8 @@ def run_cli(args: argparse.Namespace) -> int:
         connection_factory = timed_connection_factory(
             rpc_module.Connection, args.peer_timeout
         )
+        # Peers that fail stay cached so a known-dead peer is not re-queried.
+        dead_peers: set[str] = set()
 
     def canonical(height: int) -> str:
         if connection_factory is None:
@@ -2335,6 +2389,7 @@ def run_cli(args: argparse.Namespace) -> int:
             height,
             required_votes,
             query_timeout=args.peer_timeout,
+            dead_peers=dead_peers,
         )
         evidence_by_height[height] = evidence
         return evidence.selected_hash

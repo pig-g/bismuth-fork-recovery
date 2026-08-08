@@ -508,6 +508,46 @@ def test_probe_reachable_peers_filters_dead_peers(tmp_path):
     assert tool.probe_reachable_peers(factory, peers, height=100, timeout=2.0) == live
 
 
+def test_canonical_hash_at_parallel_and_caches_dead_peers(tmp_path):
+    tool = load_tool()
+    call_counts = {}
+    count_lock = threading.Lock()
+
+    def factory(peer):
+        label = f'{peer[0]}:{peer[1]}'
+        with count_lock:
+            call_counts[label] = call_counts.get(label, 0) + 1
+
+        class _Conn:
+            def command(self, method, params):
+                if peer[0] == '9.9.9.9':
+                    raise RuntimeError('dead peer')
+                return {params[0]: {'block_hash': 'b' * 56}}
+
+            def close(self):
+                pass
+
+        return _Conn()
+
+    peers = [('1.1.1.1', 5658), ('2.2.2.2', 5658), ('9.9.9.9', 5658)]
+    dead = set()
+    ev = tool.canonical_hash_at(
+        factory, peers, 100, required_votes=2, query_timeout=2.0, dead_peers=dead
+    )
+    assert ev.selected_hash == 'b' * 56
+    assert '9.9.9.9:5658' in ev.errors
+    assert call_counts['9.9.9.9:5658'] == 1  # dead peer queried exactly once
+
+    tool.canonical_hash_at(
+        factory, peers, 101, required_votes=2, query_timeout=2.0, dead_peers=dead
+    )
+    # The cached dead peer is not re-queried on a later height.
+    assert call_counts['9.9.9.9:5658'] == 1
+    # Live peers are queried at each height.
+    assert call_counts['1.1.1.1:5658'] == 2
+    assert call_counts['2.2.2.2:5658'] == 2
+
+
 def test_hold_database_locks_blocks_all_competing_writers(tmp_path):
     tool = load_tool()
     databases = []
