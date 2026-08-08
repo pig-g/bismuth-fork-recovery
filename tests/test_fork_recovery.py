@@ -458,6 +458,56 @@ def test_checkpoint_wal_ignores_non_wal_databases(tmp_path):
     tool.assert_databases_offline(paths)
 
 
+def test_compute_required_votes_pinned_peer_follows_single_peer(tmp_path):
+    tool = load_tool()
+    # Pinning one explicit peer lets us follow it: default required_votes == 1.
+    assert tool.compute_required_votes(peers_pinned=True, required_votes=None, peer_count=1) == 1
+    # Pinning several peers: all must agree.
+    assert tool.compute_required_votes(peers_pinned=True, required_votes=None, peer_count=3) == 3
+    # An explicit threshold still works on a pinned set.
+    assert tool.compute_required_votes(peers_pinned=True, required_votes=2, peer_count=3) == 2
+
+
+def test_compute_required_votes_pool_defaults_to_majority(tmp_path):
+    tool = load_tool()
+    # Unpinned pool: strict majority of the whole pool, floor of two.
+    assert tool.compute_required_votes(peers_pinned=False, required_votes=None, peer_count=16) == 9
+    assert tool.compute_required_votes(peers_pinned=False, required_votes=None, peer_count=2) == 2
+    # An unpinned single-peer pool is unusable (majority floors to 2 > 1).
+    with pytest.raises(ValueError, match="exceeds peer count"):
+        tool.compute_required_votes(peers_pinned=False, required_votes=None, peer_count=1)
+    # Explicit sub-two threshold is rejected in unpinned mode.
+    with pytest.raises(ValueError, match="at least two canonical hash votes"):
+        tool.compute_required_votes(peers_pinned=False, required_votes=1, peer_count=5)
+    with pytest.raises(ValueError, match="exceeds peer count"):
+        tool.compute_required_votes(peers_pinned=True, required_votes=2, peer_count=1)
+
+
+def test_probe_reachable_peers_filters_dead_peers(tmp_path):
+    tool = load_tool()
+    live = [("1.1.1.1", 5658), ("2.2.2.2", 5658)]
+    dead = [("3.3.3.3", 5658)]
+    peers = live + dead
+
+    def factory(peer):
+        class _Conn:
+            def __init__(self, ok):
+                self.ok = ok
+                self.closed = False
+
+            def command(self, method, params):
+                if not self.ok:
+                    raise RuntimeError("dead peer")
+                return {params[0]: {"block_hash": "a" * 56}}
+
+            def close(self):
+                self.closed = True
+
+        return _Conn(peer in live)
+
+    assert tool.probe_reachable_peers(factory, peers, height=100, timeout=2.0) == live
+
+
 def test_hold_database_locks_blocks_all_competing_writers(tmp_path):
     tool = load_tool()
     databases = []

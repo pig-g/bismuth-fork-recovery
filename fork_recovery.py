@@ -139,6 +139,59 @@ def resolve_peer_endpoints(peers: list[tuple[str, int]]) -> list[tuple[str, int]
     return resolved_peers
 
 
+def compute_required_votes(
+    *,
+    peers_pinned: bool,
+    required_votes: int | None,
+    peer_count: int,
+) -> int:
+    """Resolve the canonical-agreement vote threshold for a peer set.
+
+    ``peers_pinned`` is True when the operator explicitly pinned the peers to
+    follow (via ``--peer``): the default is then that ALL pinned peers must
+    agree, which allows following a single explicitly trusted peer (1 vote).
+    Without pinning, canonical evidence defaults to a strict majority of the
+    whole pool (>= 2), which can be impractical when only a few peers in the
+    pool are actually reachable.
+    """
+    if required_votes is not None:
+        votes = required_votes
+    elif peers_pinned:
+        votes = peer_count
+    else:
+        votes = max(2, peer_count // 2 + 1)
+    if not peers_pinned and votes < 2:
+        raise ValueError("at least two canonical hash votes are required")
+    if votes < 1 or votes > peer_count:
+        raise ValueError(
+            f"required votes ({votes}) exceeds peer count ({peer_count})"
+        )
+    return votes
+
+
+def probe_reachable_peers(
+    connection_factory,
+    peers: list[tuple[str, int]],
+    height: int,
+    timeout: float,
+) -> list[tuple[str, int]]:
+    """Return the peers that actually respond with a block hash at ``height``.
+
+    Used by unpinned automatic pool mode to base its consensus quorum on peers
+    that are genuinely reachable, rather than on the whole pool file (which may
+    list mostly-dormant or dead bootstap nodes). A responsive peer is one that
+    returns a parseable block hash within ``timeout``.
+    """
+    reachable: list[tuple[str, int]] = []
+    for peer in peers:
+        try:
+            query_peer_hash_with_deadline(connection_factory, peer, height, timeout)
+            reachable.append(peer)
+        except Exception:  # noqa: BLE001 - a dead peer is just excluded
+            continue
+    return reachable
+
+
 def resolve_db_paths(
     bismuth_root: Path,
     config: object,
@@ -703,6 +756,12 @@ def _export_attached_rows(
 # rollback of a very large DB O(window) instead of O(full DB), while still
 # catching boundary-region tampering (see test_cli_resume_rejects_changed_retained_history).
 RETAINED_WINDOW = 256
+
+# Minimum number of independently responsive peers required before automatic
+# (unpinned) pool-mode reconciliation will run. With fewer reachable peers the
+# majority-of-connected consensus rests on too few independent sources; the
+# operator should pin a peer with --peer instead.
+POOL_MIN_PEERS = 5
 
 
 def recovery_table_specs(boundary: int):
@@ -2242,12 +2301,22 @@ def run_cli(args: argparse.Namespace) -> int:
         if not peer_file.is_absolute():
             peer_file = root / peer_file
         peers = load_peers(peer_file, args.peer)
-        required_votes = args.required_votes or max(2, len(peers) // 2 + 1)
-        if required_votes < 2:
-            raise RuntimeError("at least two canonical hash votes are required")
-        if required_votes > len(peers):
-            raise RuntimeError(
-                f"required votes ({required_votes}) exceeds peer count ({len(peers)})"
+        # --peer pins the exact peers to follow (load_peers then ignores the
+        # pool file).
+        peers_pinned = bool(args.peer)
+        pool_default_votes = (
+            not peers_pinned and args.required_votes is None and not explicit_target
+        )
+        if pool_default_votes:
+            # Unpinned pool mode: the quorum is the majority of the peers that
+            # actually respond, computed after a reachability probe at the local
+            # tip (below), not the majority of the whole pool file.
+            required_votes = 0
+        else:
+            required_votes = compute_required_votes(
+                peers_pinned=peers_pinned,
+                required_votes=args.required_votes,
+                peer_count=len(peers),
             )
 
         rpc_module = import_upstream_module(root, "rpcconnections")
@@ -2273,6 +2342,22 @@ def run_cli(args: argparse.Namespace) -> int:
     with open_local_ledger_readonly(paths.ledger) as ledger:
         tip_height, tip_hash = local_tip(ledger)
         assert_consistent_database_tip(paths, tip_height, tip_hash)
+        if peer_verification and required_votes == 0:
+            # Unpinned pool mode: qualify the pool by actual reachability at the
+            # tip. Require POOL_MIN_PEERS, then quorum on the responsive subset.
+            reachable = probe_reachable_peers(
+                connection_factory, peers, tip_height, args.peer_timeout
+            )
+            if len(reachable) < POOL_MIN_PEERS:
+                raise RuntimeError(
+                    f"only {len(reachable)} of {len(peers)} pool peers reachable; "
+                    f"automatic pool mode needs at least {POOL_MIN_PEERS} responsive "
+                    "peers; pin a peer with --peer or pass --required-votes"
+                )
+            peers = reachable
+            required_votes = compute_required_votes(
+                peers_pinned=False, required_votes=None, peer_count=len(reachable)
+            )
         if args.rollback_blocks is not None:
             if args.rollback_blocks < 1:
                 raise ValueError("--rollback-blocks must be at least 1")
@@ -2325,9 +2410,13 @@ def run_cli(args: argparse.Namespace) -> int:
     )
     print(f"databases: ledger={paths.ledger} hyper={paths.hyper} index={paths.index}")
     if peer_verification:
-        print(
-            f"canonical peer policy: {required_votes} agreeing votes from {len(peers)} peers"
+        policy = (
+            f"pinned peer policy: following {len(peers)} explicitly trusted peer(s), "
+            "all must agree"
+            if peers_pinned
+            else f"canonical peer policy: {required_votes} agreeing votes from {len(peers)} peers"
         )
+        print(policy)
     else:
         print("manual peer validation: disabled")
     for height, evidence in sorted(evidence_by_height.items(), reverse=True):
