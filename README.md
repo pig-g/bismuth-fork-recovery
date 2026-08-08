@@ -9,9 +9,9 @@ By default, the tool finds the last block hash shared by the local ledger and mu
 - **Dry-run is the default.**
 - The Bismuth node must be completely stopped.
 - A listening node port, matching `node.py` process, SQLite write lock, failed `quick_check`, or WAL/SHM sidecar aborts recovery.
-- A single peer is never sufficient. Each queried height requires at least two agreeing hashes.
-- Split or insufficient peer evidence aborts without mutation.
-- Before a plan is printed, ledger and hyper must each contain exactly one physical reward row at the retained target, and both hashes must match canonical evidence.
+- Whenever peer verification is used, a single peer is never sufficient. Each queried height requires at least two agreeing hashes.
+- In automatic mode, split or insufficient peer evidence aborts without mutation. Explicit/manual rollback is local-only by default; peer verification is optional.
+- Before a plan is printed, ledger and hyper must each contain exactly one physical reward row at the retained target and must agree on its hash. Automatic mode and peer-verified explicit mode also require that hash to match canonical evidence.
 - Apply rechecks the unchanged local tip and retained target under exclusion. Automatic mode also rechecks the first divergent block; explicit mode intentionally permits that deleted block to be canonical.
 - Height `A` is preserved; deletion begins at `A + 1`.
 - Apply reserves the configured node port and keeps the maintenance guard active through finalization.
@@ -71,7 +71,7 @@ The base directory is validated using upstream sentinel files. Config-relative d
 
 ## Peer policy
 
-By default, peers are loaded from the checkout's `suggested_peers.txt`; a strict majority with a minimum of two votes is required. For operator-selected trusted peers:
+Automatic fork recovery loads peers from the checkout's `suggested_peers.txt`; a strict majority with a minimum of two votes is required. Explicit/manual rollback does not contact peers unless verification is requested. To verify an explicit target against the default peer file, add `--verify-peers`. For operator-selected trusted peers:
 
 ```bash
 python3 fork_recovery.py \
@@ -80,7 +80,7 @@ python3 fork_recovery.py \
   --required-votes 2
 ```
 
-Explicit `--peer` values replace the peer file. A bounded per-peer timeout defaults to 10 seconds and can be changed with `--peer-timeout`.
+Explicit `--peer` values replace the peer file. In an explicit rollback, `--peer`, a non-default `--peer-file`, `--required-votes`, or `--verify-peers` opts into peer verification. A bounded per-peer timeout defaults to 10 seconds and can be changed with `--peer-timeout`.
 
 ## Apply recovery
 
@@ -108,7 +108,7 @@ python3 fork_recovery.py --rollback-blocks 100
 
 These options are mutually exclusive with each other and with `--resume`. `--rollback-blocks` must be positive and must leave at least height 1 retained; `--rollback-to` must be between height 1 and the current local tip. From the retained target through the local tip, ledger and hyper must contain the same contiguous, integer-height, duplicate-free reward-block interval, including matching hashes at every height, so `COUNT` always means exactly that many blocks. The local tip and interval are rechecked under the apply lock, so a tip or row change after planning aborts rather than shifting the requested boundary.
 
-Explicit rollback still requires multiple peers to agree that the retained target's hash is canonical. Ledger and hyper must each contain exactly one reward-bearing row at that height and must agree on the same hash. Unlike automatic fork recovery, the first deleted block is allowed to be canonical. After restart, the node can download that suffix again when canonical peers still serve the required range and normal synchronization permits it; this is not a guarantee under every peer-availability or checkpoint condition.
+Explicit rollback is a local operator action and does not require peer access. Ledger and hyper must each contain exactly one reward-bearing row at the retained target and must agree on the same hash. To add canonical target verification, use `--verify-peers` or explicit peer options; verification then uses the same strict quorum rules as automatic mode. Unlike automatic fork recovery, the first deleted block is allowed to be canonical. After restart, the node can download that suffix again when canonical peers still serve the required range and normal synchronization permits it; this is not a guarantee under every peer-availability or checkpoint condition.
 
 Both commands above are dry-runs. After inspecting the exact target and deletion range, add `--apply` to perform the operation:
 
@@ -146,7 +146,9 @@ python3 fork_recovery.py \
 
 Resume requires the root `.fork_recovery_active.json` marker, an exact match between its bundle path and `--resume`, a matching marker/manifest operation ID, and an exact `RESUME <operation-id>` confirmation. A `journal_guard`-only resume restores journal modes and exits without changing blockchain rows; the operator must rerun a dry-run. A full resume verifies the tail digest, exact database paths/inodes, schemas, retained contents, ancestor, and original journal modes. Each targeted table must be exactly PRE (matches the archive) or POST (no rollback rows remain). PRE/POST mixtures are completed with idempotent deletes; any UNKNOWN state aborts without mutation.
 
-An explicit rollback bundle also persists its exact peer policy and binds it to the target evidence. Selection mode, rollback request, and peer policy are canonicalized into a recovery-intent digest that is independently bound by the root active marker before the prepared manifest is installed; resume rejects either a manifest self-digest mismatch or a root/manifest intent mismatch. Resume re-resolves the peer policy and rejects textual or resolved endpoint aliases before it can count votes. If every targeted table is still PRE, resume refreshes target quorum under exclusion before the first resumed delete; a changed chain view, unavailable quorum, malformed response, or timeout aborts without mutation. Once any table is already POST, resume follows the immutable bundle plan deterministically instead of making crash recovery depend on current network availability.
+Every explicit rollback bundle binds its selection mode, rollback request, and optional peer policy into a recovery-intent digest that is independently recorded by the root active marker before the prepared manifest is installed; resume rejects either a manifest self-digest mismatch or a root/manifest intent mismatch. A local-manual bundle records a null peer policy and resumes without network access. A peer-verified bundle re-resolves its saved policy and rejects textual or resolved endpoint aliases before counting votes. If every targeted table in a peer-verified bundle is still PRE, resume refreshes target quorum under exclusion before the first resumed delete; once any table is POST, recovery follows the immutable bundle plan deterministically without a network dependency.
+
+Apply performs one full SQLite integrity cycle after exclusive locks are acquired and one after the rollback rows are deleted but before commit. Commit/relock, journal restoration, and finalization repeat exact logical, metadata, and fingerprint checks without rescanning every database page. This preserves pre/post fail-closed gates while avoiding the former six full integrity cycles on large ledgers.
 
 After success, restart the unchanged node yourself:
 

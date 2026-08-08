@@ -874,6 +874,63 @@ def test_cli_rollback_blocks_dry_run_retains_tip_minus_count(tmp_path):
         ).fetchone() == (10,)
 
 
+def test_cli_explicit_rollback_does_not_require_peers_by_default(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    (root / "suggested_peers.txt").unlink()
+    (root / "rpcconnections.py").unlink()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--rollback-blocks",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "manual peer validation: disabled" in result.stdout
+    assert "rollback: 9-10 (2 blocks)" in result.stdout
+
+
+def test_cli_explicit_apply_without_peers_records_local_manual_intent(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    bundle = tmp_path / "manual-local-bundle"
+    (root / "suggested_peers.txt").unlink()
+    (root / "rpcconnections.py").unlink()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--rollback-blocks",
+            "2",
+            "--apply",
+            "--bundle-dir",
+            str(bundle),
+        ],
+        input=f"ROLLBACK 9-10 TO 8 {valid_hash('fork-8')}\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["selection_mode"] == "explicit"
+    assert manifest["rollback_request"] == {"blocks": 2}
+    assert manifest["peer_policy"] is None
+    assert manifest["canonical_evidence"] == {}
+
+
 def test_cli_help_describes_automatic_and_explicit_rollback_modes():
     result = subprocess.run(
         [sys.executable, str(TOOL_PATH), "--help"],
@@ -1068,6 +1125,34 @@ def test_cli_explicit_rollback_rejects_noncanonical_retained_target(tmp_path):
         assert connection.execute(
             "SELECT MAX(block_height) FROM transactions"
         ).fetchone() == (10,)
+
+
+def test_cli_explicit_custom_peer_file_opts_into_target_verification(tmp_path):
+    root = create_fake_bismuth_root(tmp_path)
+    peer_file = root / "trusted_peers.txt"
+    peer_file.write_text(
+        json.dumps({"203.0.113.10": 5658, "203.0.113.11": 5658}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--rollback-blocks",
+            "2",
+            "--peer-file",
+            peer_file.name,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "explicit rollback target does not match canonical peer evidence" in result.stderr
 
 
 def test_cli_rollback_blocks_rejects_gapped_reward_suffix(tmp_path):
@@ -1797,6 +1882,242 @@ def test_cli_explicit_pre_resume_refreshes_retained_target_quorum(
             assert connection.execute(
                 "SELECT MAX(block_height) FROM transactions WHERE reward != 0"
             ).fetchone() == (expected_tip,)
+
+
+def test_cli_local_manual_pre_resume_is_peer_independent(tmp_path):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    paths = tool.DbPaths(
+        root / "static/ledger.db",
+        root / "static/hyper.db",
+        root / "static/index.db",
+    )
+    plan = tool.RecoveryPlan(
+        10,
+        valid_hash("fork-10"),
+        8,
+        valid_hash("fork-8"),
+        9,
+        2,
+    )
+    bundle = tmp_path / "local-manual-pre-bundle"
+    rollback_request = {"blocks": 2}
+    intent_digest = tool.recovery_intent_digest(
+        "explicit", rollback_request, None
+    )
+    tool.write_recovery_bundle(
+        paths,
+        plan,
+        bundle,
+        selection_mode="explicit",
+        rollback_request=rollback_request,
+        peer_policy=None,
+    )
+    tool.write_root_active_marker(root, bundle, intent_digest)
+    (root / "suggested_peers.txt").unlink()
+    (root / "rpcconnections.py").unlink()
+    operation_id = json.loads(
+        (bundle / "manifest.json").read_text(encoding="utf-8")
+    )["operation_id"]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--bismuth-dir",
+            str(root),
+            "--apply",
+            "--resume",
+            str(bundle),
+        ],
+        input=f"RESUME {operation_id}\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "RECOVERY RESUME COMPLETE" in result.stdout
+    for database in (paths.ledger, paths.hyper):
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT MAX(block_height) FROM transactions WHERE reward != 0"
+            ).fetchone() == (8,)
+
+
+def test_resume_rewrite_preserves_bound_recovery_intent_on_crash(
+    tmp_path, monkeypatch
+):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    paths = tool.DbPaths(
+        root / "static/ledger.db",
+        root / "static/hyper.db",
+        root / "static/index.db",
+    )
+    plan = tool.RecoveryPlan(
+        10,
+        valid_hash("fork-10"),
+        8,
+        valid_hash("fork-8"),
+        9,
+        2,
+    )
+    bundle = tmp_path / "resume-marker-crash-bundle"
+    rollback_request = {"blocks": 2}
+    intent_digest = tool.recovery_intent_digest(
+        "explicit", rollback_request, None
+    )
+    tool.write_recovery_bundle(
+        paths,
+        plan,
+        bundle,
+        selection_mode="explicit",
+        rollback_request=rollback_request,
+        peer_policy=None,
+    )
+    tool.write_root_active_marker(root, bundle, intent_digest)
+    operation_id = json.loads(
+        (bundle / "manifest.json").read_text(encoding="utf-8")
+    )["operation_id"]
+    monkeypatch.setattr("builtins.input", lambda _prompt: f"RESUME {operation_id}")
+
+    def stop_after_marker(_bundle):
+        raise RuntimeError("simulated stop after marker rewrite")
+
+    monkeypatch.setattr(tool, "mark_recovery_committing", stop_after_marker)
+    with pytest.raises(RuntimeError, match="simulated stop after marker rewrite"):
+        tool.resume_recovery(
+            root,
+            type("Config", (), {"port": 65534})(),
+            paths,
+            bundle,
+        )
+
+    marker = tool.read_root_active_marker(root)
+    assert marker is not None
+    assert marker["recovery_intent_sha256"] == intent_digest
+
+
+def test_hold_database_locks_does_not_run_an_implicit_integrity_scan(
+    tmp_path, monkeypatch
+):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    paths = tool.DbPaths(
+        root / "static/ledger.db",
+        root / "static/hyper.db",
+        root / "static/index.db",
+    )
+    statements = []
+    original_connect = tool.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(tool.sqlite3, "connect", recording_connect)
+    with tool.hold_database_locks(paths):
+        pass
+
+    assert not any("quick_check" in statement.casefold() for statement in statements)
+
+
+def test_offline_apply_preflight_can_defer_integrity_scan_to_exclusive_lock(
+    tmp_path, monkeypatch
+):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    paths = tool.DbPaths(
+        root / "static/ledger.db",
+        root / "static/hyper.db",
+        root / "static/index.db",
+    )
+    statements = []
+    original_connect = tool.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(tool.sqlite3, "connect", recording_connect)
+    tool.assert_databases_offline(paths, check_integrity=False)
+
+    assert not any("quick_check" in statement.casefold() for statement in statements)
+    assert sum(statement == "BEGIN IMMEDIATE" for statement in statements) == 3
+
+
+def test_post_recovery_revalidation_can_skip_repeated_full_integrity_scan(tmp_path):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    connection = sqlite3.connect(root / "static/ledger.db", isolation_level=None)
+    try:
+        connection.execute(
+            "ATTACH DATABASE ? AS hyperdb", (str(root / "static/hyper.db"),)
+        )
+        connection.execute(
+            "ATTACH DATABASE ? AS indexdb", (str(root / "static/index.db"),)
+        )
+        connection.execute("BEGIN EXCLUSIVE")
+        tool.apply_atomic_rollbacks(connection, 9)
+        statements = []
+        connection.set_trace_callback(statements.append)
+        tool.assert_post_recovery_locked(
+            connection,
+            tool.RecoveryPlan(
+                10,
+                valid_hash("fork-10"),
+                8,
+                valid_hash("fork-8"),
+                9,
+                2,
+            ),
+            check_integrity=False,
+        )
+    finally:
+        connection.rollback()
+        connection.close()
+
+    assert not any("quick_check" in statement.casefold() for statement in statements)
+
+
+def test_local_manual_apply_runs_one_pre_and_one_post_integrity_cycle(
+    tmp_path, monkeypatch
+):
+    tool = load_tool()
+    root = create_fake_bismuth_root(tmp_path)
+    bundle = tmp_path / "integrity-budget-bundle"
+    statements = []
+    original_connect = tool.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(tool.sqlite3, "connect", recording_connect)
+    monkeypatch.setattr(tool, "confirm_apply", lambda _plan: None)
+    result = tool.run_cli(
+        tool.build_parser().parse_args(
+            [
+                "--bismuth-dir",
+                str(root),
+                "--rollback-blocks",
+                "2",
+                "--apply",
+                "--bundle-dir",
+                str(bundle),
+            ]
+        )
+    )
+
+    assert result == 0
+    quick_checks = [
+        statement for statement in statements if "quick_check" in statement.casefold()
+    ]
+    assert len(quick_checks) == 6
 
 
 def test_cli_resume_rejects_missing_root_active_marker(tmp_path):

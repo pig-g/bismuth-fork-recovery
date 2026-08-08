@@ -150,7 +150,11 @@ def resolve_db_paths(
     )
 
 
-def assert_databases_offline(paths: DbPaths, allow_recovery_sidecars: bool = False) -> None:
+def assert_databases_offline(
+    paths: DbPaths,
+    allow_recovery_sidecars: bool = False,
+    check_integrity: bool = True,
+) -> None:
     """Fail closed unless all databases are present, clean, and write-unlocked."""
     for path in paths:
         if not path.is_file():
@@ -165,9 +169,10 @@ def assert_databases_offline(paths: DbPaths, allow_recovery_sidecars: bool = Fal
 
         connection = sqlite3.connect(path, timeout=0.0)
         try:
-            check = connection.execute("PRAGMA quick_check").fetchone()
-            if check != ("ok",):
-                raise RuntimeError(f"SQLite quick_check failed for {path}: {check}")
+            if check_integrity:
+                check = connection.execute("PRAGMA quick_check").fetchone()
+                if check != ("ok",):
+                    raise RuntimeError(f"SQLite quick_check failed for {path}: {check}")
             connection.execute("BEGIN IMMEDIATE")
             connection.rollback()
         except sqlite3.OperationalError as exc:
@@ -220,9 +225,6 @@ def hold_database_locks(
             if str(mode).casefold() != "delete":
                 raise RuntimeError(f"could not set {schema} journal_mode=DELETE")
             connection.execute(f"PRAGMA {schema}.synchronous=FULL")
-            check = connection.execute(f"PRAGMA {schema}.quick_check").fetchone()
-            if check != ("ok",):
-                raise RuntimeError(f"SQLite quick_check failed for {schema}: {check}")
         connection.execute("BEGIN EXCLUSIVE")
         locked = LockedDatabases(connection, original_modes)
         yield locked
@@ -1129,12 +1131,17 @@ def assert_post_recovery(paths: DbPaths, plan: RecoveryPlan) -> None:
 
 
 def assert_post_recovery_locked(
-    connection: sqlite3.Connection, plan: RecoveryPlan
+    connection: sqlite3.Connection,
+    plan: RecoveryPlan,
+    check_integrity: bool = True,
 ) -> None:
-    for schema in ("main", "hyperdb", "indexdb"):
-        check = connection.execute(f"PRAGMA {schema}.quick_check").fetchone()
-        if check != ("ok",):
-            raise RuntimeError(f"post-recovery quick_check failed for {schema}: {check}")
+    if check_integrity:
+        for schema in ("main", "hyperdb", "indexdb"):
+            check = connection.execute(f"PRAGMA {schema}.quick_check").fetchone()
+            if check != ("ok",):
+                raise RuntimeError(
+                    f"post-recovery quick_check failed for {schema}: {check}"
+                )
     expected_tip = (plan.ancestor_height, plan.ancestor_hash)
     tip = attached_tip(connection, "main")
     if tip != expected_tip:
@@ -1399,6 +1406,12 @@ def validate_resume_plan_metadata(
         matches = False
     if not matches:
         raise RuntimeError("rollback request does not match recovery plan")
+    if manifest.get("peer_policy") is None:
+        if manifest.get("canonical_evidence") != {}:
+            raise RuntimeError(
+                "local manual recovery cannot contain canonical peer evidence"
+            )
+        return
     parse_explicit_peer_policy(manifest, plan)
 
 
@@ -1587,7 +1600,7 @@ def finalize_restored_recovery(
         verify_resume_table_metadata(
             connection, manifest, tail, plan.first_delete_height
         )
-        assert_post_recovery_locked(connection, plan)
+        assert_post_recovery_locked(connection, plan, check_integrity=False)
         complete_recovery_bundle(bundle_dir, root)
 
 
@@ -1680,6 +1693,7 @@ def resume_recovery(
                 )
             if (
                 manifest.get("selection_mode") == "explicit"
+                and manifest.get("peer_policy") is not None
                 and all(state == "PRE" for state in states.values())
             ):
                 if explicit_canonical_hash is None:
@@ -1700,7 +1714,7 @@ def resume_recovery(
             verify_resume_table_metadata(
                 connection, manifest, tail, plan.first_delete_height
             )
-            assert_post_recovery_locked(connection, plan)
+            assert_post_recovery_locked(connection, plan, check_integrity=False)
             mark_recovery_restoring(bundle_dir)
         restoring_manifest = json.loads(
             (Path(bundle_dir) / "manifest.json").read_text(encoding="utf-8")
@@ -1718,16 +1732,16 @@ def make_node_stub() -> object:
     return SimpleNamespace(logger=SimpleNamespace(app_log=logger))
 
 
-def validate_bismuth_root(path: Path) -> Path:
+def validate_bismuth_root(path: Path, require_peer_support: bool = True) -> Path:
     root = Path(path).expanduser().resolve()
-    required = (
+    required = [
         "node.py",
         "options.py",
-        "rpcconnections.py",
         "dbhandler.py",
         "config.txt",
-        "suggested_peers.txt",
-    )
+    ]
+    if require_peer_support:
+        required.append("rpcconnections.py")
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
         raise RuntimeError(
@@ -2025,6 +2039,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peer-file", default="suggested_peers.txt")
     parser.add_argument("--required-votes", type=int)
     parser.add_argument("--peer-timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--verify-peers",
+        action="store_true",
+        help="opt in to canonical peer verification for an explicit manual rollback",
+    )
     rollback_group = parser.add_mutually_exclusive_group()
     rollback_group.add_argument(
         "--rollback-to",
@@ -2047,7 +2066,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_cli(args: argparse.Namespace) -> int:
-    root = validate_bismuth_root(Path(args.bismuth_dir))
+    explicit_target = args.rollback_to is not None or args.rollback_blocks is not None
+    explicit_peer_options = (
+        args.verify_peers
+        or bool(args.peer)
+        or args.required_votes is not None
+        or args.peer_file != "suggested_peers.txt"
+    )
+    peer_verification = not explicit_target or explicit_peer_options
+    root = validate_bismuth_root(
+        Path(args.bismuth_dir),
+        require_peer_support=peer_verification and not args.resume,
+    )
     config = load_node_config(root, args.config_custom)
     paths = resolve_db_paths(root, config, args.index_db)
     active_marker = read_root_active_marker(root)
@@ -2091,13 +2121,18 @@ def run_cli(args: argparse.Namespace) -> int:
                 )
     assert_node_port_closed(int(config.port))
     assert_databases_offline(
-        paths, allow_recovery_sidecars=bool(args.resume and active_marker)
+        paths,
+        allow_recovery_sidecars=bool(args.resume and active_marker),
+        check_integrity=not args.apply,
     )
     if resume_path is not None and resume_manifest is not None:
         if resume_manifest.get("status") in {"journal_guard", "journal_restored"}:
             return resume_journal_guard(root, config, paths, resume_path)
         explicit_canonical = None
-        if resume_manifest.get("selection_mode") == "explicit":
+        if (
+            resume_manifest.get("selection_mode") == "explicit"
+            and resume_manifest.get("peer_policy") is not None
+        ):
             explicit_canonical = explicit_resume_canonical_query(root, resume_manifest)
         return resume_recovery(
             root,
@@ -2107,27 +2142,34 @@ def run_cli(args: argparse.Namespace) -> int:
             explicit_canonical_hash=explicit_canonical,
         )
 
-    peer_file = Path(args.peer_file).expanduser()
-    if not peer_file.is_absolute():
-        peer_file = root / peer_file
-    peers = load_peers(peer_file, args.peer)
-    required_votes = args.required_votes or max(2, len(peers) // 2 + 1)
-    if required_votes < 2:
-        raise RuntimeError("at least two canonical hash votes are required")
-    if required_votes > len(peers):
-        raise RuntimeError(
-            f"required votes ({required_votes}) exceeds peer count ({len(peers)})"
-        )
-
-    rpc_module = import_upstream_module(root, "rpcconnections")
-    if hasattr(rpc_module, "LTIMEOUT"):
-        rpc_module.LTIMEOUT = args.peer_timeout
-    connection_factory = timed_connection_factory(
-        rpc_module.Connection, args.peer_timeout
-    )
+    peers: list[tuple[str, int]] = []
+    required_votes = 0
+    connection_factory = None
     evidence_by_height: dict[int, CanonicalHashEvidence] = {}
 
+    if peer_verification:
+        peer_file = Path(args.peer_file).expanduser()
+        if not peer_file.is_absolute():
+            peer_file = root / peer_file
+        peers = load_peers(peer_file, args.peer)
+        required_votes = args.required_votes or max(2, len(peers) // 2 + 1)
+        if required_votes < 2:
+            raise RuntimeError("at least two canonical hash votes are required")
+        if required_votes > len(peers):
+            raise RuntimeError(
+                f"required votes ({required_votes}) exceeds peer count ({len(peers)})"
+            )
+
+        rpc_module = import_upstream_module(root, "rpcconnections")
+        if hasattr(rpc_module, "LTIMEOUT"):
+            rpc_module.LTIMEOUT = args.peer_timeout
+        connection_factory = timed_connection_factory(
+            rpc_module.Connection, args.peer_timeout
+        )
+
     def canonical(height: int) -> str:
+        if connection_factory is None:
+            raise RuntimeError("canonical peer verification is not enabled")
         evidence = canonical_hash_at(
             connection_factory,
             peers,
@@ -2141,7 +2183,6 @@ def run_cli(args: argparse.Namespace) -> int:
     with open_local_ledger_readonly(paths.ledger) as ledger:
         tip_height, tip_hash = local_tip(ledger)
         assert_consistent_database_tip(paths, tip_height, tip_hash)
-        explicit_target = args.rollback_to is not None or args.rollback_blocks is not None
         if args.rollback_blocks is not None:
             if args.rollback_blocks < 1:
                 raise ValueError("--rollback-blocks must be at least 1")
@@ -2163,7 +2204,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 paths, ledger, ancestor_height, tip_height
             )
             ancestor_hash = local_hash_at(ledger, ancestor_height)
-            if canonical(ancestor_height) != ancestor_hash:
+            if peer_verification and canonical(ancestor_height) != ancestor_hash:
                 raise RuntimeError(
                     "explicit rollback target does not match canonical peer evidence"
                 )
@@ -2193,7 +2234,12 @@ def run_cli(args: argparse.Namespace) -> int:
         f"({plan.rollback_blocks} blocks)"
     )
     print(f"databases: ledger={paths.ledger} hyper={paths.hyper} index={paths.index}")
-    print(f"canonical peer policy: {required_votes} agreeing votes from {len(peers)} peers")
+    if peer_verification:
+        print(
+            f"canonical peer policy: {required_votes} agreeing votes from {len(peers)} peers"
+        )
+    else:
+        print("manual peer validation: disabled")
     for height, evidence in sorted(evidence_by_height.items(), reverse=True):
         print(f"  height {height}: selected={evidence.selected_hash}")
         for peer, vote in evidence.votes.items():
@@ -2257,11 +2303,12 @@ def run_cli(args: argparse.Namespace) -> int:
                     raise RuntimeError(
                         "ledger and hyper explicit rollback suffixes disagree"
                     )
-            canonical_ancestor_hash = canonical(plan.ancestor_height)
-            if current_ancestor_hash != canonical_ancestor_hash:
-                raise RuntimeError(
-                    "apply boundary failed: ancestor hash no longer agrees"
-                )
+            if peer_verification:
+                canonical_ancestor_hash = canonical(plan.ancestor_height)
+                if current_ancestor_hash != canonical_ancestor_hash:
+                    raise RuntimeError(
+                        "apply boundary failed: ancestor hash no longer agrees"
+                    )
             if not explicit_target:
                 first_divergent_hash = local_hash_at(
                     connection, plan.first_delete_height
@@ -2284,7 +2331,7 @@ def run_cli(args: argparse.Namespace) -> int:
                     "required_votes": required_votes,
                     "query_timeout": args.peer_timeout,
                 }
-                if explicit_target
+                if explicit_target and peer_verification
                 else None
             )
             write_root_active_marker(
@@ -2320,7 +2367,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 committed_tail,
                 plan.first_delete_height,
             )
-            assert_post_recovery_locked(connection, plan)
+            assert_post_recovery_locked(connection, plan, check_integrity=False)
             mark_recovery_restoring(bundle)
         restoring_manifest, restoring_plan, restoring_tail = load_resume_bundle(
             bundle, paths
