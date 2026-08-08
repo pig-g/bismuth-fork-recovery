@@ -9,7 +9,7 @@ By default, the tool finds the last block hash shared by the local ledger and mu
 - **Dry-run is the default.**
 - The Bismuth node must be completely stopped.
 - A listening node port, matching `node.py` process, SQLite write lock, failed `quick_check`, or WAL/SHM sidecar aborts recovery.
-- Whenever peer verification is used, a single peer is never sufficient. Each queried height requires at least two agreeing hashes.
+- By default, peer verification requires at least two agreeing hashes per queried height. A single trusted peer is followed only when it is deliberately pinned with `--peer` (an explicit operator trust decision); pinning two or more peers requires all of them to agree.
 - In automatic mode, split or insufficient peer evidence aborts without mutation. Explicit/manual rollback is local-only by default; peer verification is optional.
 - Before a plan is printed, ledger and hyper must each contain exactly one physical reward row at the retained target and must agree on its hash. Automatic mode and peer-verified explicit mode also require that hash to match canonical evidence.
 - Apply rechecks the unchanged local tip and retained target under exclusion. Automatic mode also rechecks the first divergent block; explicit mode intentionally permits that deleted block to be canonical.
@@ -71,7 +71,7 @@ The base directory is validated using upstream sentinel files. Config-relative d
 
 ## Peer policy
 
-Automatic fork recovery loads peers from the checkout's `suggested_peers.txt`; a strict majority with a minimum of two votes is required. Explicit/manual rollback does not contact peers unless verification is requested. To verify an explicit target against the default peer file, add `--verify-peers`. For operator-selected trusted peers:
+Automatic fork recovery probes the checkout's `suggested_peers.txt` in parallel and keeps only the peers that actually respond; it requires at least 5 responsive peers and then a strict majority of those reachable peers (`reachable//2 + 1`). Explicit/manual rollback does not contact peers unless verification is requested. To verify an explicit target against the default peer file, add `--verify-peers`. To follow specifically trusted peers, pin them with `--peer` (each `--peer` value replaces the peer file); pinned peers are followed only when all of them agree, so a single `--peer` reconciles the chain to one operator-trusted peer. `--required-votes N` overrides the threshold explicitly:
 
 ```bash
 python3 fork_recovery.py \
@@ -81,6 +81,25 @@ python3 fork_recovery.py \
 ```
 
 Explicit `--peer` values replace the peer file. In an explicit rollback, `--peer`, a non-default `--peer-file`, `--required-votes`, or `--verify-peers` opts into peer verification. A bounded per-peer timeout defaults to 10 seconds and can be changed with `--peer-timeout`.
+
+## Quick workflow
+
+A full divergent-chain recovery in one pass:
+
+```bash
+# 1. Stop the node completely (the tool refuses to run while it is up).
+# 2. Inspect the plan (dry-run is the default; automatic mode needs either
+#    5+ responsive peers or a pinned --peer).
+python3 fork_recovery.py --bismuth-dir . --checkpoint-wal
+
+# 3. Apply the rollback (fold leftover WAL, then recover).
+python3 fork_recovery.py --bismuth-dir . --checkpoint-wal --apply
+
+# 4. Restart the unchanged node; it re-syncs the deleted suffix.
+python3 node.py
+```
+
+Explicit rewind uses `--rollback-to HEIGHT` or `--rollback-blocks N`; follow a specific trusted peer with `--peer IP:PORT`. Automatic rollback (no `--rollback-*`) finds the shared ancestor with the reachable peers and rewinds to just after it. Every command above is a dry-run until `--apply`.
 
 ## Apply recovery
 
