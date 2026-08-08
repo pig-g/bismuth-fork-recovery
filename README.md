@@ -150,6 +150,8 @@ Every explicit rollback bundle binds its selection mode, rollback request, and o
 
 Apply binds a bounded window of retained rows just below the boundary plus the archived tail into the manifest, then performs the rollback as one atomic SQLite transaction. **By default the tool skips the whole-DB `PRAGMA quick_check` scan**: a tail delete never touches retained pages, so integrity of the retained data is guaranteed by the exclusive locks, the ancestor/tip hash checks, the journal guard, and normal WAL/journal atomicity, and a full scan would cost minutes on a large observer DB. Add `--integrity-check` to also run a full pre/post SQLite b-tree integrity scan (3 databases x 2 cycles) to additionally detect pre-existing external corruption. Commit/relock, journal restoration, and finalization repeat exact logical, metadata, and bounded fingerprint checks without scanning every database page.
 
+If the stopped node left SQLite WAL sidecars (`-wal`/`-shm`), pass `--checkpoint-wal` to fold them into their main DBs (`PRAGMA wal_checkpoint(TRUNCATE)`) before the offline check runs. This only acts once the node is confirmed stopped (port closed, no node process) and fails closed if another connection holds a database busy; it is ignored on `--resume`, where sidecars are intentional. Without it, leftover sidecars abort the run.
+
 After success, restart the unchanged node yourself:
 
 ```bash

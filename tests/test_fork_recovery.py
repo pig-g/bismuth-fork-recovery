@@ -397,6 +397,67 @@ def test_assert_databases_offline_rejects_wal_sidecar(tmp_path):
         tool.assert_databases_offline(tool.DbPaths(*databases))
 
 
+def test_checkpoint_wal_folds_wal_sidecars_and_preserves_data(tmp_path):
+    tool = load_tool()
+    # A WAL-mode DB with a committed row. This SQLite build checkpoints-and-
+    # removes small WALs on the last close, so to test the fold+cleanup we stub
+    # the -wal/-shm sidecars the way a stopped multi-connection observer would
+    # actually leave behind (mirrors test_assert_databases_offline_rejects_wal_sidecar).
+    ledger = tmp_path / "ledger.db"
+    c = sqlite3.connect(ledger)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("CREATE TABLE t (block_height INTEGER, block_hash TEXT)")
+    c.execute("INSERT INTO t VALUES (4933078, 'abc')")
+    c.commit()
+    c.close()
+    Path(f"{ledger}-wal").write_bytes(b"stale")
+    Path(f"{ledger}-shm").write_bytes(b"stale")
+    hyper = tmp_path / "hyper.db"
+    index = tmp_path / "index.db"
+    sqlite3.connect(hyper).close()
+    sqlite3.connect(index).close()
+    paths = tool.DbPaths(ledger, hyper, index)
+
+    # The leftover -wal sidecar must trip the fail-closed offline check first.
+    with pytest.raises(RuntimeError, match="WAL/SHM sidecar"):
+        tool.assert_databases_offline(paths)
+
+    tool.checkpoint_wal(paths)
+
+    # After checkpointing the sidecars are gone, the committed row is preserved,
+    # and the offline check passes.
+    assert not (tmp_path / "ledger.db-wal").exists()
+    assert not (tmp_path / "ledger.db-shm").exists()
+    with sqlite3.connect(f"file:{ledger}?mode=ro&immutable=1", uri=True) as check:
+        assert check.execute("SELECT block_hash FROM t").fetchone()[0] == "abc"
+    tool.assert_databases_offline(paths)
+
+
+def test_checkpoint_wal_ignores_non_wal_databases(tmp_path):
+    tool = load_tool()
+    ledger = tmp_path / "ledger.db"
+    hyper = tmp_path / "hyper.db"
+    index = tmp_path / "index.db"
+    for path in (ledger, hyper, index):
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE t (x INTEGER)")
+        c.close()
+    # Only hyper is in WAL mode; ledger/index stay in DELETE mode.
+    c = sqlite3.connect(hyper)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.close()
+    paths = tool.DbPaths(ledger, hyper, index)
+
+    tool.checkpoint_wal(paths)
+
+    # WAL sidecars are folded/removed; the DELETE-mode DBs gain no -wal file and
+    # a WAL DB that is left untouched passes the offline check as-is.
+    assert not (tmp_path / "hyper.db-wal").exists()
+    assert not (tmp_path / "ledger.db-wal").exists()
+    assert not (tmp_path / "index.db-wal").exists()
+    tool.assert_databases_offline(paths)
+
+
 def test_hold_database_locks_blocks_all_competing_writers(tmp_path):
     tool = load_tool()
     databases = []

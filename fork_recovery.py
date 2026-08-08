@@ -189,6 +189,48 @@ def assert_databases_offline(
             connection.close()
 
 
+def checkpoint_wal(paths: DbPaths) -> None:
+    """Fold SQLite WAL sidecars into their main DBs (safe offline finalization).
+
+    Opens each database and, for those in journal_mode=WAL, runs
+    ``PRAGMA wal_checkpoint(TRUNCATE)`` so committed frames are written into the
+    main DB and the ``-wal``/``-shm`` sidecars are removed. Non-WAL databases
+    (e.g. the index in ``journal_mode=delete``) are left untouched.
+
+    Must only be called after the node is verified stopped (its port closed and
+    no node process running). Fails closed if another connection is holding a
+    database busy, so a leftover sidecar can never be dropped while data may
+    still be in flight.
+    """
+    for path in (paths.ledger, paths.hyper, paths.index):
+        if not path.is_file():
+            continue
+        connection = sqlite3.connect(str(path), timeout=30)
+        try:
+            mode = (
+                str(connection.execute("PRAGMA journal_mode").fetchone()[0]).casefold()
+            )
+            if mode != "wal":
+                continue
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if row is not None and row[0]:
+                raise RuntimeError(
+                    "wal_checkpoint for %s is busy; another process is using the database"
+                    % path
+                )
+        finally:
+            connection.close()
+        # A TRUNCATE checkpoint folds every committed frame into the main DB, so
+        # any -wal/-shm that survive the close are empty and safe to remove. Some
+        # SQLite builds leave a stale -shm behind; removing it (only after the
+        # checkpoint succeeded and was not busy) keeps the offline precondition
+        # clean without risking in-flight data.
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{path}{suffix}")
+            if sidecar.exists():
+                sidecar.unlink()
+
+
 @contextmanager
 def hold_database_locks(
     paths: DbPaths,
@@ -2096,6 +2138,15 @@ def build_parser() -> argparse.ArgumentParser:
             "off by default because a tail rollback is atomic"
         ),
     )
+    parser.add_argument(
+        "--checkpoint-wal",
+        action="store_true",
+        help=(
+            "before running, fold leftover SQLite WAL sidecars into their main DBs "
+            "(PRAGMA wal_checkpoint(TRUNCATE)); only acts when the node is already "
+            "stopped, and is ignored on --resume where sidecars are intentional"
+        ),
+    )
     return parser
 
 
@@ -2156,6 +2207,9 @@ def run_cli(args: argparse.Namespace) -> int:
                     "root active marker recovery intent does not match the recovery manifest"
                 )
     assert_node_port_closed(int(config.port))
+    if args.checkpoint_wal and not (args.resume and active_marker is not None):
+        assert_no_node_processes(root)
+        checkpoint_wal(paths)
     assert_databases_offline(
         paths,
         allow_recovery_sidecars=bool(args.resume and active_marker),
