@@ -2469,9 +2469,20 @@ def run_cli(args: argparse.Namespace) -> int:
             f"pinned peer policy: following {len(peers)} explicitly trusted peer(s), "
             "all must agree"
             if peers_pinned
-            else f"canonical peer policy: {required_votes} agreeing votes from {len(peers)} peers"
+            else f"canonical peer policy: requires at least {required_votes} agreeing votes "
+            f"from {len(peers)} peers"
         )
         print(policy)
+        if evidence_by_height:
+            # Game/required-votes threshold vs the actual on-chain agreement:
+            # count how many peers really voted for the selected hash.
+            last_height = sorted(evidence_by_height)[-1]
+            evidence = evidence_by_height[last_height]
+            agreed = sum(1 for vote in evidence.votes.values() if vote == evidence.selected_hash)
+            print(
+                f"voting result: {agreed} agreeing votes from "
+                f"{len(evidence.votes)} peers at height {last_height}"
+            )
     else:
         print("manual peer validation: disabled")
     for height, evidence in sorted(evidence_by_height.items(), reverse=True):

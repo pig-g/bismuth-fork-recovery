@@ -1148,6 +1148,10 @@ def test_cli_rollback_blocks_dry_run_retains_tip_minus_count(tmp_path):
     assert "DRY RUN" in result.stdout
     assert f"rollback target: 8 {valid_hash('main-8')}" in result.stdout
     assert "rollback: 9-10 (2 blocks)" in result.stdout
+    # The gate line names the required-votes threshold; the next line reports
+    # the actual on-chain agreement (should not be confused with the gate).
+    assert "canonical peer policy: requires at least 2 agreeing votes from 2 peers" in result.stdout
+    assert "voting result: 2 agreeing votes from 2 peers at height 8" in result.stdout
     with sqlite3.connect(root / "static/ledger.db") as connection:
         assert connection.execute(
             "SELECT MAX(block_height) FROM transactions"
