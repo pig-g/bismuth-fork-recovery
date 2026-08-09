@@ -2667,3 +2667,84 @@ def test_cli_resume_cleans_stale_marker_after_complete_manifest(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert not (root / tool.ROOT_ACTIVE_MARKER).exists()
+
+
+def _write_force_db(path, heights, hashes):
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE transactions (block_height INTEGER, reward REAL, block_hash TEXT);"
+        "CREATE TABLE misc (block_height INTEGER);"
+        "CREATE TABLE tokens (block_height INTEGER);"
+        "CREATE TABLE aliases (block_height INTEGER);"
+    )
+    for height in heights:
+        connection.execute(
+            "INSERT INTO transactions VALUES (?,?,?)", (height, 1.0, hashes[height])
+        )
+        connection.execute("INSERT INTO misc VALUES (?)", (height,))
+    connection.commit()
+    connection.close()
+
+
+def _force_paths(tmp_path, ledger, hyper, index):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(ledger=ledger, hyper=hyper, index=index)
+
+
+def test_force_rollback_finds_and_reconverges_on_common_ancestor(tmp_path):
+    """--force-rollback-blocks clamps to the last common ledger/hyper ancestor
+    and trims both stores so they re-converge, ready for a clean re-sync."""
+    tool = load_tool()
+    common_A = 90
+    ledger_tip, hyper_tip = 100, 103
+
+    ledger_hash = {
+        h: valid_hash(f"c{h}" if h <= common_A else f"L{h}") for h in range(1, ledger_tip + 1)
+    }
+    hyper_hash = {
+        h: valid_hash(f"c{h}" if h <= common_A else f"H{h}") for h in range(1, hyper_tip + 1)
+    }
+    ledger = tmp_path / "ledger.db"
+    hyper = tmp_path / "hyper.db"
+    index = tmp_path / "index.db"
+    _write_force_db(ledger, range(1, ledger_tip + 1), ledger_hash)
+    _write_force_db(hyper, range(1, hyper_tip + 1), hyper_hash)
+    index.write_bytes(b"")
+    connection = sqlite3.connect(index)
+    connection.executescript(
+        "CREATE TABLE tokens (block_height INTEGER); CREATE TABLE aliases (block_height INTEGER);"
+    )
+    connection.commit()
+    connection.close()
+    paths = _force_paths(tmp_path, ledger, hyper, index)
+
+    assert tool._last_common_local_ancestor(paths) == common_A
+
+    # blocks=5 -> target 98 is in the divergent zone -> clamps down to A.
+    top = hyper_tip
+    ancestor = top - 5
+    if ancestor > common_A:
+        ancestor = common_A
+    first_delete = ancestor + 1
+    tool._force_wipe_tail(
+        ledger,
+        [
+            ("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (first_delete, -first_delete)),
+            ("DELETE FROM misc WHERE block_height >= ?", (first_delete,)),
+        ],
+    )
+    tool._force_wipe_tail(
+        hyper,
+        [
+            ("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (first_delete, -first_delete)),
+            ("DELETE FROM misc WHERE block_height >= ?", (first_delete,)),
+        ],
+    )
+    with closing(sqlite3.connect(ledger)) as c:
+        new_ledger = tool.local_tip(c)
+    with closing(sqlite3.connect(hyper)) as c:
+        new_hyper = tool.local_tip(c)
+    assert new_ledger == (common_A, ledger_hash[common_A])
+    assert new_hyper == (common_A, hyper_hash[common_A])
+    assert new_ledger == new_hyper

@@ -20,7 +20,7 @@ import threading
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2236,6 +2236,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="delete exactly COUNT blocks from the current local tip",
     )
     rollback_group.add_argument(
+        "--force-rollback-blocks",
+        type=int,
+        metavar="COUNT",
+        help=(
+            "FORCE hard cut: delete COUNT blocks off the highest of the ledger/hyper tips "
+            "even when the local ledger and hyper tips disagree. Intentionally bypasses "
+            "the normal fail-closed consistency guards and is clamped to the last common "
+            "ledger/hyper ancestor so the cut re-converges there (i.e. it rolls back "
+            "further automatically when needed). The operator accepts re-downloading the "
+            "removed tail from the network; use full resync if no common ancestor exists."
+        ),
+    )
+    rollback_group.add_argument(
         "--resume", metavar="BUNDLE", help="resume the exact active recovery bundle"
     )
     parser.add_argument("--apply", action="store_true")
@@ -2261,6 +2274,166 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _last_common_local_ancestor(paths: DbPaths) -> int | None:
+    """Highest height where the ledger and hyper reward hashes agree (or None).
+
+    Read-only. Returns the last block the two local stores have in common; below
+    it they are guaranteed to agree, so it is the safe floor for a force cut.
+    """
+    def ro(path: Path) -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+    with closing(ro(paths.ledger)) as ledger, closing(ro(paths.hyper)) as hyper:
+        try:
+            ledger_top = local_tip(ledger)[0]
+            hyper_top = local_tip(hyper)[0]
+        except ValueError:
+            return None
+        for height in range(min(ledger_top, hyper_top), 0, -1):
+            try:
+                if unique_local_reward_hash(ledger, height) == unique_local_reward_hash(hyper, height):
+                    return height
+            except ValueError:
+                continue
+    return None
+
+
+def _force_wipe_tail(path: Path, statements: list[tuple[str, tuple[int, ...]]]) -> None:
+    """Atomically delete the tail rows past the retained height in one DB file.
+
+    Uses the exact row boundaries of the normal rollback path
+    (``apply_atomic_rollbacks``) on a single database, one exclusive transaction.
+    """
+    connection = sqlite3.connect(str(path), timeout=30)
+    try:
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("BEGIN EXCLUSIVE")
+        for sql, params in statements:
+            connection.execute(sql, params)
+        connection.commit()
+    finally:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+
+
+def run_force_rollback(
+    root: Path,
+    config,
+    paths: DbPaths,
+    blocks: int,
+    *,
+    apply: bool,
+) -> int:
+    """Deliberate operator-accepted hard cut for a node whose local ledger and
+    hyper tips have diverged and therefore cannot be rolled back by the normal
+    fail-closed path.
+
+    This is an explicit, visibly-degraded mode requested by the operator: it
+    bypasses the ledger/hyper tip-consistency guards and cuts COUNT blocks off
+    the higher of the two tips. To keep the result re-syncable it clamps the
+    target down to the last common ledger/hyper ancestor (rolling back further
+    automatically when COUNT would land in the divergent zone). The operator
+    accepts that the removed tail is re-downloaded from the network; if there is
+    no common ancestor at all, full resync is the only safe option.
+    """
+    import shutil
+    from datetime import datetime, timezone
+
+    if blocks < 1:
+        raise ValueError("--force-rollback-blocks must be at least 1")
+
+    def ro(path: Path) -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+    assert_no_node_processes(root)
+    assert_node_port_closed(int(config.port))
+    checkpoint_wal(paths)
+    assert_databases_offline(paths, allow_recovery_sidecars=False, check_integrity=False)
+
+    with closing(ro(paths.ledger)) as ledger:
+        ledger_tip = local_tip(ledger)
+    with closing(ro(paths.hyper)) as hyper:
+        hyper_tip = local_tip(hyper)
+    top = max(ledger_tip[0], hyper_tip[0])
+    top_hash = ledger_tip[1] if ledger_tip[0] == top else hyper_tip[1]
+
+    common = _last_common_local_ancestor(paths)
+    if common is None:
+        raise RuntimeError(
+            "no common local ledger/hyper ancestor; force-trim has no safe anchor - "
+            "stop and use full resync (delete ledger/hyper/index and re-download)"
+        )
+
+    ancestor_height = top - blocks
+    if ancestor_height > common:
+        ancestor_height = common  # roll back further so ledger and hyper re-converge
+    if ancestor_height < 1:
+        ancestor_height = 1
+    with closing(ro(paths.ledger)) as ledger:
+        ancestor_hash = unique_local_reward_hash(ledger, ancestor_height)
+
+    plan = RecoveryPlan(
+        top,
+        top_hash,
+        ancestor_height,
+        ancestor_hash,
+        ancestor_height + 1,
+        top - ancestor_height,
+    )
+
+    print(f"mode: {'APPLY' if apply else 'DRY RUN'}")
+    print(f"ledger tip: {ledger_tip[0]} {ledger_tip[1]}")
+    print(f"hyper  tip: {hyper_tip[0]} {hyper_tip[1]}")
+    print(f"last common local ancestor (clamp floor): {common}")
+    print(f"FORCE rollback target: {ancestor_height} {ancestor_hash}")
+    print(f"rollback: heights {ancestor_height + 1}..{top} ({plan.rollback_blocks} blocks)")
+    print(f"databases: ledger={paths.ledger} hyper={paths.hyper} index={paths.index}")
+    print("WARNING: force mode intentionally bypasses fork_recovery's normal fail-closed")
+    print("         ledger/hyper consistency guards; operator accepts re-downloading the")
+    print("         removed tail from the network. Back the DB directory up first.")
+    if not apply:
+        print("dry-run only; re-run with --apply to perform the force rollback")
+        return 0
+
+    confirm_apply(plan)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = root / "force_rollback_backup" / f"force_{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for database in (paths.ledger, paths.hyper, paths.index):
+        shutil.copy2(database, backup_dir / database.name)
+        for sidecar_name in (f"{database}-wal", f"{database}-shm"):
+            sidecar = Path(sidecar_name)
+            if sidecar.exists():
+                shutil.copy2(sidecar, backup_dir / sidecar.name)
+
+    first_delete = ancestor_height + 1
+    _force_wipe_tail(paths.ledger, [
+        ("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (first_delete, -first_delete)),
+        ("DELETE FROM misc WHERE block_height >= ?", (first_delete,)),
+    ])
+    _force_wipe_tail(paths.hyper, [
+        ("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (first_delete, -first_delete)),
+        ("DELETE FROM misc WHERE block_height >= ?", (first_delete,)),
+    ])
+    _force_wipe_tail(paths.index, [
+        ("DELETE FROM tokens WHERE block_height >= ?", (first_delete,)),
+        ("DELETE FROM aliases WHERE block_height >= ?", (first_delete,)),
+    ])
+
+    with closing(ro(paths.ledger)) as ledger, closing(ro(paths.hyper)) as hyper:
+        new_tip = local_tip(ledger)
+        new_hyper = local_tip(hyper)
+    print(f"backup: {backup_dir}")
+    print(f"post-trim ledger tip: {new_tip[0]} {new_tip[1]}")
+    print(f"post-trim hyper  tip: {new_hyper[0]} {new_hyper[1]}")
+    if new_tip != (ancestor_height, ancestor_hash) or new_hyper != (ancestor_height, ancestor_hash):
+        raise RuntimeError("post-trim ledger/hyper tips did not reconverge on the force target")
+    print("RECOVERY COMPLETE (force)")
+    print("Restart the existing Bismuth node to resynchronize the removed tail.")
+    return 0
+
+
 def run_cli(args: argparse.Namespace) -> int:
     global INTEGRITY_CHECK
     INTEGRITY_CHECK = bool(args.integrity_check)
@@ -2278,6 +2451,14 @@ def run_cli(args: argparse.Namespace) -> int:
     )
     config = load_node_config(root, args.config_custom)
     paths = resolve_db_paths(root, config, args.index_db)
+    if args.force_rollback_blocks is not None:
+        return run_force_rollback(
+            root,
+            config,
+            paths,
+            args.force_rollback_blocks,
+            apply=bool(args.apply),
+        )
     active_marker = read_root_active_marker(root)
     if active_marker is not None and not args.resume:
         raise RuntimeError(
