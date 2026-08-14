@@ -2,7 +2,7 @@
 
 Experimental, operator-run recovery tool for a stopped [Bismuth](https://github.com/bismuthfoundation/Bismuth) node that needs divergent-chain recovery or an intentional canonical suffix rewind.
 
-By default, the tool finds the last block hash shared by the local ledger and multiple canonical peers. It can also intentionally remove a canonical suffix down to an operator-selected height or by a selected block count. Every mode shows a dry-run plan and—only after `--apply` plus exact confirmation—deletes the selected tail from the offline databases using the same row boundaries as Bismuth's rollback methods.
+By default, the tool finds the last block hash shared by the local ledger and multiple canonical peers. It can also intentionally remove a canonical suffix down to an operator-selected height or by a selected block count, and — when the local ledger and hyper tips have diverged — provide a deliberate forced hard cut (`--force-rollback-blocks`) that re-converges them before re-syncing. Every mode shows a dry-run plan and—only after `--apply` plus exact confirmation—deletes the selected tail from the offline databases using the same row boundaries as Bismuth's rollback methods.
 
 ## Safety contract
 
@@ -12,6 +12,7 @@ By default, the tool finds the last block hash shared by the local ledger and mu
 - By default, peer verification requires at least two agreeing hashes per queried height. A single trusted peer is followed only when it is deliberately pinned with `--peer` (an explicit operator trust decision); pinning two or more peers requires all of them to agree.
 - In automatic mode, split or insufficient peer evidence aborts without mutation. Explicit/manual rollback is local-only by default; peer verification is optional.
 - Before a plan is printed, ledger and hyper must each contain exactly one physical reward row at the retained target and must agree on its hash. Automatic mode and peer-verified explicit mode also require that hash to match canonical evidence.
+- `--force-rollback-blocks N` is an explicit, operator-accepted safety downgrade: it bypasses the ledger/hyper tip-consistency requirement, clamps the cut to the last common ledger/hyper ancestor so the trimmed stores re-converge, and assumes the removed tail is re-downloaded from the network.
 - Apply rechecks the unchanged local tip and retained target under exclusion. Automatic mode also rechecks the first divergent block; explicit mode intentionally permits that deleted block to be canonical.
 - Height `A` is preserved; deletion begins at `A + 1`.
 - Apply reserves the configured node port and keeps the maintenance guard active through finalization.
@@ -128,6 +129,30 @@ python3 fork_recovery.py --rollback-blocks 100
 These options are mutually exclusive with each other and with `--resume`. `--rollback-blocks` must be positive and must leave at least height 1 retained; `--rollback-to` must be between height 1 and the current local tip. From the retained target through the local tip, ledger and hyper must contain the same contiguous, integer-height, duplicate-free reward-block interval, including matching hashes at every height, so `COUNT` always means exactly that many blocks. The local tip and interval are rechecked under the apply lock, so a tip or row change after planning aborts rather than shifting the requested boundary.
 
 Explicit rollback is a local operator action and does not require peer access. Ledger and hyper must each contain exactly one reward-bearing row at the retained target and must agree on the same hash. To add canonical target verification, use `--verify-peers` or explicit peer options; verification then uses the same strict quorum rules as automatic mode. Unlike automatic fork recovery, the first deleted block is allowed to be canonical. After restart, the node can download that suffix again when canonical peers still serve the required range and normal synchronization permits it; this is not a guarantee under every peer-availability or checkpoint condition.
+
+### Forced rollback when the local ledger and hyper disagree
+
+Every normal mode — automatic and explicit — shares one hard precondition: the **current** ledger and hyper tips must agree. A node can reach a state where those two local tips diverge (a common companion of a stuck sync that keeps failing with `Transaction ... already in ledger`), and every normal command then aborts immediately with `ERROR: inconsistent database tail: ledger and hyper tips do not match`. A full re-sync always works, but the operator may prefer to keep the local chain and simply cut the polluted tail.
+
+`--force-rollback-blocks N` is that deliberate hard cut. It is a visible safety downgrade and may only be used when the operator accepts re-downloading the removed suffix from the network:
+
+```bash
+# Inspect the forced plan (dry-run is the default).
+python3 fork_recovery.py --force-rollback-blocks 100
+
+# Perform the cut after the exact-phrase confirmation.
+python3 fork_recovery.py --force-rollback-blocks 100 --apply
+
+# Restart the unchanged node; it re-syncs the removed tail from seed peers.
+python3 node.py
+```
+
+Semantics:
+
+- It cuts `COUNT` blocks off the **higher** of the ledger/hyper tips and deletes that same range from **both** stores (and the matching index rows), bypassing the normal current-tip consistency guard. It is local-only and never contacts peers.
+- To guarantee the cut leaves a re-syncable, consistent pair of databases, the target clamps **down to the last common ledger/hyper ancestor**: if `COUNT` would end inside the divergent zone, the tool rolls back further automatically until ledger and hyper re-converge at the cut. This is the "if it does not clean up, roll back more" behaviour, made automatic.
+- If the two stores share **no** common local ancestor at all, force mode refuses and reports that full resync (delete the databases and re-download) is the only safe option.
+- Everything else keeps the tool's norms: dry-run by default, `--apply` with the exact confirmation phrase, an automatic `force_rollback_backup/<timestamp>/` snapshot of the databases (and their WAL/SHM sidecars) before any mutation, atomic per-database exclusive trims using the same row boundaries (`A + 1`) as the normal path, and a post-trim re-convergence verification that both tips return to the retained target.
 
 **Automatic mode pins the peers to follow with `--peer`.** Automatic fork recovery ***without*** pinning qualifies the pool by actual reachability at the local tip: it probes every pool peer (in parallel), keeps only the peers that respond, requires at least 5 responsive peers, and then requires a strict majority of **those reachable peers** (`required_votes = reachable//2 + 1`). This avoids the old behavior of requiring a majority of the whole pool file (which lists mostly-dormant/dead bootstrap nodes and made consensus impractical when few peers were up). Peer hash queries for a height run concurrently, and a peer that fails is cached so it is not re-queried (and re-timed-out) on later ancestor-search heights. Passing one or more `--peer HOST:PORT` (which also replaces the pool file as the peer source) pins the trusted set: the default then becomes that **all pinned peers must agree**, so a single `--peer` reconciles the local chain to that one explicitly trusted peer (`required_votes = 1`). The ancestor search, exclusive-lock rollback, and fail-closed guarantees are unchanged; only who is trusted changes. Pass `--required-votes N` to override the threshold explicitly.
 
