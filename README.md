@@ -31,6 +31,8 @@ This is an offline maintenance tool, not a consensus or protocol change. If no c
 - An unmodified Foundation Bismuth checkout
 - The normal Bismuth node environment
 
+Any checkout works: the tool adapts to the `read()` signature it finds in the checkout's `options.py` (the oldest `read()`, the later `read(custom_config_file=None)`, and the current `read(config_file=...)`). Checkouts older than the 2026-08-01 Foundation master resolve `config.txt`/`config_custom.txt` against the process directory, so the tool loads the config from the Bismuth base directory for them; a custom config with a non-conventional name can only be honoured by a checkout whose `read()` accepts `custom_config_file`, and the tool says so instead of silently ignoring it. If you hit `read() got an unexpected keyword argument 'config_file'`, you are running a build of this tool from before that compatibility fix — re-download `fork_recovery.py`.
+
 For a fresh Bismuth environment, follow upstream's full node installation sequence. `simple-crypt` is a manual prerequisite and is not installed by `requirements-node.txt` itself:
 
 ```bash

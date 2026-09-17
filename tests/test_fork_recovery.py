@@ -433,6 +433,144 @@ def test_load_node_config_finds_custom_config_inside_external_bismuth_root(tmp_p
         sys.path.remove(str(root.resolve()))
 
 
+def test_load_node_config_supports_legacy_read_without_config_file(tmp_path):
+    tool = load_tool()
+    root = tmp_path / "Bismuth"
+    root.mkdir()
+    (root / "config.txt").write_text("base=true\n", encoding="utf-8")
+    custom = root / "config_custom.txt"
+    custom.write_text("custom=true\n", encoding="utf-8")
+    (root / "options.py").write_text(
+        "import os, pathlib\n"
+        "class Get:\n"
+        "    def read(self, custom_config_file=None):\n"
+        "        self.cwd = os.getcwd()\n"
+        "        self.loaded_base = pathlib.Path('config.txt').read_text()\n"
+        "        self.received_custom = custom_config_file\n"
+        "        self.loaded_custom = pathlib.Path('config_custom.txt').read_text()\n",
+        encoding="utf-8",
+    )
+    cwd = Path.cwd()
+    stale = sys.modules.pop("options", None)
+    try:
+        config = tool.load_node_config(root.resolve(), custom_config=None)
+
+        # The legacy read() is CWD-relative, so it must run from the root.
+        assert config.cwd == str(root.resolve())
+        assert config.loaded_base == "base=true\n"
+        assert config.loaded_custom == "custom=true\n"
+        assert config.received_custom == str(custom.resolve())
+        assert Path.cwd() == cwd
+    finally:
+        sys.modules.pop("options", None)
+        if stale is not None:
+            sys.modules["options"] = stale
+        sys.path.remove(str(root.resolve()))
+
+
+def test_load_node_config_supports_oldest_read_without_custom_parameter(tmp_path):
+    tool = load_tool()
+    root = tmp_path / "Bismuth"
+    root.mkdir()
+    (root / "config.txt").write_text("base=true\n", encoding="utf-8")
+    (root / "config_custom.txt").write_text("custom=true\n", encoding="utf-8")
+    (root / "options.py").write_text(
+        "import os, pathlib\n"
+        "class Get:\n"
+        "    def read(self):\n"
+        "        self.cwd = os.getcwd()\n"
+        "        self.loaded_base = pathlib.Path('config.txt').read_text()\n"
+        "        self.loaded_custom = pathlib.Path('config_custom.txt').read_text()\n",
+        encoding="utf-8",
+    )
+    cwd = Path.cwd()
+    stale = sys.modules.pop("options", None)
+    try:
+        config = tool.load_node_config(root.resolve(), custom_config=None)
+
+        assert config.cwd == str(root.resolve())
+        assert config.loaded_base == "base=true\n"
+        assert config.loaded_custom == "custom=true\n"
+        assert Path.cwd() == cwd
+    finally:
+        sys.modules.pop("options", None)
+        if stale is not None:
+            sys.modules["options"] = stale
+        sys.path.remove(str(root.resolve()))
+
+
+def test_load_node_config_legacy_read_honours_explicit_custom_path(tmp_path):
+    tool = load_tool()
+    root = tmp_path / "Bismuth"
+    root.mkdir()
+    (root / "config.txt").write_text("base=true\n", encoding="utf-8")
+    custom = root / "my_node_config.txt"
+    custom.write_text("custom=true\n", encoding="utf-8")
+    (root / "options.py").write_text(
+        "class Get:\n"
+        "    def read(self, custom_config_file=None):\n"
+        "        self.received_custom = custom_config_file\n",
+        encoding="utf-8",
+    )
+    stale = sys.modules.pop("options", None)
+    try:
+        config = tool.load_node_config(root.resolve(), custom_config=str(custom))
+        assert config.received_custom == str(custom.resolve())
+    finally:
+        sys.modules.pop("options", None)
+        if stale is not None:
+            sys.modules["options"] = stale
+        sys.path.remove(str(root.resolve()))
+
+
+def test_load_node_config_oldest_read_rejects_explicit_non_conventional_custom(tmp_path):
+    tool = load_tool()
+    root = tmp_path / "Bismuth"
+    root.mkdir()
+    (root / "config.txt").write_text("base=true\n", encoding="utf-8")
+    custom = root / "my_node_config.txt"
+    custom.write_text("custom=true\n", encoding="utf-8")
+    (root / "options.py").write_text(
+        "class Get:\n"
+        "    def read(self):\n"
+        "        self.called = True\n",
+        encoding="utf-8",
+    )
+    stale = sys.modules.pop("options", None)
+    try:
+        with pytest.raises(RuntimeError, match="explicit custom config"):
+            tool.load_node_config(root.resolve(), custom_config=str(custom))
+    finally:
+        sys.modules.pop("options", None)
+        if stale is not None:
+            sys.modules["options"] = stale
+        sys.path.remove(str(root.resolve()))
+
+
+def test_load_node_config_restores_cwd_when_read_fails(tmp_path):
+    tool = load_tool()
+    root = tmp_path / "Bismuth"
+    root.mkdir()
+    (root / "config.txt").write_text("base=true\n", encoding="utf-8")
+    (root / "options.py").write_text(
+        "class Get:\n"
+        "    def read(self):\n"
+        "        raise ValueError('boom')\n",
+        encoding="utf-8",
+    )
+    cwd = Path.cwd()
+    stale = sys.modules.pop("options", None)
+    try:
+        with pytest.raises(ValueError, match="boom"):
+            tool.load_node_config(root.resolve(), custom_config=None)
+        assert Path.cwd() == cwd
+    finally:
+        sys.modules.pop("options", None)
+        if stale is not None:
+            sys.modules["options"] = stale
+        sys.path.remove(str(root.resolve()))
+
+
 def test_import_upstream_module_validates_path_before_executing_shadow(tmp_path):
     tool = load_tool()
     root = tmp_path / "Bismuth"

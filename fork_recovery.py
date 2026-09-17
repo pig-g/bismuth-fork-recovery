@@ -8,6 +8,7 @@ import errno
 import gzip
 import hashlib
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -1956,6 +1957,37 @@ def import_upstream_module(root: Path, module_name: str):
     return module
 
 
+@contextmanager
+def working_directory(directory: Path):
+    """Temporarily run with the process CWD set to ``directory``.
+
+    Old Foundation ``options.py`` resolves ``config.txt`` and the implicit
+    ``config_custom.txt`` against the process CWD, so a legacy config load has to
+    happen from the Bismuth root exactly like ``node.py`` run from that root.
+    Only used during single-threaded start-up.
+    """
+    previous = str(Path.cwd())
+    os.chdir(directory)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def upstream_read_keywords(config) -> set:
+    """Keyword parameters accepted by the checkout's ``options.Config.read``.
+
+    The signature changed across Foundation releases (``read()``, then
+    ``read(custom_config_file=None)``, then ``read(config_file=...)``); detect
+    what the local checkout supports instead of assuming the newest one. An
+    uninspectable reader yields an empty set and takes the legacy path.
+    """
+    try:
+        return set(inspect.signature(config.read).parameters)
+    except (TypeError, ValueError):
+        return set()
+
+
 def load_node_config(root: Path, custom_config: str | None):
     options_module = import_upstream_module(root, "options")
     config = options_module.Get()
@@ -1967,7 +1999,27 @@ def load_node_config(root: Path, custom_config: str | None):
         )
     elif (root / "config_custom.txt").is_file():
         custom_path = str((root / "config_custom.txt").resolve())
-    config.read(config_file=str(root / "config.txt"), custom_config_file=custom_path)
+    keywords = upstream_read_keywords(config)
+    if "config_file" in keywords:
+        config.read(
+            config_file=str(root / "config.txt"), custom_config_file=custom_path
+        )
+        return config
+    coincidental_custom = str((root / "config_custom.txt").resolve())
+    if custom_path is not None and "custom_config_file" not in keywords:
+        if custom_path != coincidental_custom:
+            raise RuntimeError(
+                "this Bismuth checkout's options.py cannot be pointed at an "
+                f"explicit custom config ({root / 'options.py'} only implements "
+                "read() for config.txt): update the checkout to Foundation "
+                "master after 2026-08-01, or use the conventional "
+                "config_custom.txt in the Bismuth base directory"
+            )
+    with working_directory(root):
+        if "custom_config_file" in keywords:
+            config.read(custom_config_file=custom_path)
+        else:
+            config.read()
     return config
 
 
